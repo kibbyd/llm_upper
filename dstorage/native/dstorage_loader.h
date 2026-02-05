@@ -164,6 +164,33 @@ DS_API int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, 
 // external memory object, and shared NT handle.
 DS_API void ds_loader_cuda_destroy(CUDAInteropHandle interop);
 
+// --- Stream-to-CUDA (the integration point for Ollama) ---
+
+// Loads file data directly to a CUDA device pointer in one call.
+// Uses a reusable internal staging buffer (D3D12 shared heap + CUDA interop).
+// Path: SSD -> DirectStorage DMA -> staging GPU buffer -> cuMemcpyDtoD -> dest.
+// The staging buffer auto-grows as needed and is reused across calls.
+// cuda_dest_ptr is a CUdeviceptr (e.g., from ggml_tensor->data or cuMemAlloc).
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_stream_to_cuda(
+    DSLoaderHandle loader,
+    const wchar_t* file_path,
+    uint64_t file_offset,
+    uint64_t size,
+    uint64_t cuda_dest_ptr
+);
+
+// Allocate a CUDA device buffer via cuMemAlloc (for testing).
+// Returns CUdeviceptr as uint64, or 0 on failure.
+DS_API uint64_t ds_loader_cuda_alloc(uint64_t size);
+
+// Free a CUDA device buffer allocated by ds_loader_cuda_alloc.
+DS_API void ds_loader_cuda_free(uint64_t ptr);
+
+// Copy from a raw CUDA device pointer to host memory (for testing).
+// src_cuda_ptr is a CUdeviceptr (from cuMemAlloc or ggml tensor->data).
+DS_API int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size);
+
 #ifdef __cplusplus
 }
 #endif

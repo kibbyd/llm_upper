@@ -56,6 +56,10 @@ var (
 	procCudaGetDevicePtr   *syscall.Proc
 	procCudaMemcpyToHost   *syscall.Proc
 	procCudaDestroy        *syscall.Proc
+	procStreamToCuda       *syscall.Proc
+	procCudaAlloc          *syscall.Proc
+	procCudaFree           *syscall.Proc
+	procCudaDtoH           *syscall.Proc
 	dllLoaded              bool
 	dllLoadAttempted       bool
 )
@@ -119,6 +123,10 @@ func loadDLL() error {
 		{"ds_loader_cuda_get_device_ptr", &procCudaGetDevicePtr},
 		{"ds_loader_cuda_memcpy_to_host", &procCudaMemcpyToHost},
 		{"ds_loader_cuda_destroy", &procCudaDestroy},
+		{"ds_loader_stream_to_cuda", &procStreamToCuda},
+		{"ds_loader_cuda_alloc", &procCudaAlloc},
+		{"ds_loader_cuda_free", &procCudaFree},
+		{"ds_loader_cuda_dtoh", &procCudaDtoH},
 	}
 
 	for _, p := range procs {
@@ -594,4 +602,75 @@ func (ci *CUDAInterop) Destroy() {
 		procCudaDestroy.Call(ci.handle)
 		ci.handle = 0
 	}
+}
+
+// --- Stream-to-CUDA (the integration point for Ollama) ---
+
+// StreamToCuda loads file data directly to a CUDA device pointer in one call.
+// Uses a reusable internal staging buffer (D3D12 shared heap + CUDA interop).
+// Path: SSD -> DirectStorage DMA -> staging GPU buffer -> cuMemcpyDtoD -> dest.
+// cudaDestPtr is a CUdeviceptr (e.g., from ggml_tensor->data).
+// This is the function that replaces Ollama's io.ReadFull + cudaMemcpyHostToDevice loop.
+func (l *Loader) StreamToCuda(filePath string, fileOffset uint64, size uint64, cudaDestPtr uint64) error {
+	if l.closed {
+		return errors.New("loader is closed")
+	}
+	if size == 0 || cudaDestPtr == 0 {
+		return ErrInvalidArgument
+	}
+
+	widePath, err := syscall.UTF16PtrFromString(filePath)
+	if err != nil {
+		return fmt.Errorf("invalid path: %v", err)
+	}
+
+	ret, _, _ := procStreamToCuda.Call(
+		l.handle,
+		uintptr(unsafe.Pointer(widePath)),
+		uintptr(fileOffset),
+		uintptr(size),
+		uintptr(cudaDestPtr),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("stream to CUDA failed: HRESULT=0x%08X (size=%d)", uint32(GetLastHResult()), size)
+	}
+	return nil
+}
+
+// CudaAlloc allocates a CUDA device buffer via cuMemAlloc.
+// Returns a CUdeviceptr as uint64. Used for testing.
+func CudaAlloc(size uint64) uint64 {
+	if err := loadDLL(); err != nil {
+		return 0
+	}
+	ret, _, _ := procCudaAlloc.Call(uintptr(size))
+	return uint64(ret)
+}
+
+// CudaFree frees a CUDA device buffer allocated by CudaAlloc.
+func CudaFree(ptr uint64) {
+	if err := loadDLL(); err != nil {
+		return
+	}
+	procCudaFree.Call(uintptr(ptr))
+}
+
+// CudaDtoH copies data from a raw CUDA device pointer to host memory.
+// Used for testing StreamToCuda results.
+func CudaDtoH(srcCudaPtr uint64, dest []byte) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	if len(dest) == 0 || srcCudaPtr == 0 {
+		return ErrInvalidArgument
+	}
+	ret, _, _ := procCudaDtoH.Call(
+		uintptr(srcCudaPtr),
+		uintptr(unsafe.Pointer(&dest[0])),
+		uintptr(len(dest)),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("CUDA DtoH failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
 }

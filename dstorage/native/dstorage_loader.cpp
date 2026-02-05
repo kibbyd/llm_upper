@@ -78,6 +78,8 @@ typedef CUresult (*PFN_cuImportExternalMemory)(CUexternalMemory*, const CUDA_EXT
 typedef CUresult (*PFN_cuExternalMemoryGetMappedBuffer)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1*);
 typedef CUresult (*PFN_cuDestroyExternalMemory)(CUexternalMemory);
 typedef CUresult (*PFN_cuMemcpyDtoH_v2)(void*, CUdeviceptr, size_t);
+typedef CUresult (*PFN_cuMemcpyDtoD_v2)(CUdeviceptr, CUdeviceptr, size_t);
+typedef CUresult (*PFN_cuMemAlloc_v2)(CUdeviceptr*, size_t);
 typedef CUresult (*PFN_cuMemFree_v2)(CUdeviceptr);
 typedef CUresult (*PFN_cuDeviceGetLuid)(char* luid, unsigned int* deviceNodeMask, CUdevice dev);
 
@@ -90,6 +92,8 @@ static PFN_cuImportExternalMemory            g_cuImportExternalMemory = nullptr;
 static PFN_cuExternalMemoryGetMappedBuffer   g_cuExternalMemoryGetMappedBuffer = nullptr;
 static PFN_cuDestroyExternalMemory           g_cuDestroyExternalMemory = nullptr;
 static PFN_cuMemcpyDtoH_v2                   g_cuMemcpyDtoH = nullptr;
+static PFN_cuMemcpyDtoD_v2                   g_cuMemcpyDtoD = nullptr;
+static PFN_cuMemAlloc_v2                     g_cuMemAlloc = nullptr;
 static PFN_cuMemFree_v2                      g_cuMemFree = nullptr;
 static PFN_cuDeviceGetLuid                   g_cuDeviceGetLuid = nullptr;
 
@@ -162,13 +166,16 @@ static bool EnsureCudaLoaded() {
     g_cuExternalMemoryGetMappedBuffer = (PFN_cuExternalMemoryGetMappedBuffer)GetProcAddress(g_nvcudaModule, "cuExternalMemoryGetMappedBuffer");
     g_cuDestroyExternalMemory = (PFN_cuDestroyExternalMemory)GetProcAddress(g_nvcudaModule, "cuDestroyExternalMemory");
     g_cuMemcpyDtoH = (PFN_cuMemcpyDtoH_v2)GetProcAddress(g_nvcudaModule, "cuMemcpyDtoH_v2");
+    g_cuMemcpyDtoD = (PFN_cuMemcpyDtoD_v2)GetProcAddress(g_nvcudaModule, "cuMemcpyDtoD_v2");
+    g_cuMemAlloc = (PFN_cuMemAlloc_v2)GetProcAddress(g_nvcudaModule, "cuMemAlloc_v2");
     g_cuMemFree = (PFN_cuMemFree_v2)GetProcAddress(g_nvcudaModule, "cuMemFree_v2");
     g_cuDeviceGetLuid = (PFN_cuDeviceGetLuid)GetProcAddress(g_nvcudaModule, "cuDeviceGetLuid");
 
     if (!g_cuInit || !g_cuDeviceGet || !g_cuDevicePrimaryCtxRetain ||
         !g_cuCtxSetCurrent || !g_cuImportExternalMemory ||
         !g_cuExternalMemoryGetMappedBuffer || !g_cuDestroyExternalMemory ||
-        !g_cuMemcpyDtoH || !g_cuMemFree || !g_cuDeviceGetLuid) {
+        !g_cuMemcpyDtoH || !g_cuMemcpyDtoD || !g_cuMemAlloc ||
+        !g_cuMemFree || !g_cuDeviceGetLuid) {
         return false;
     }
 
@@ -239,6 +246,18 @@ struct DSLoader {
         uint64_t heapSize;
     };
     std::unordered_map<ID3D12Resource*, SharedHeapEntry> sharedHeaps;
+
+    // Reusable staging buffer for stream-to-cuda operations.
+    // Grows as needed, never shrinks. Destroyed with the loader.
+    struct {
+        ComPtr<ID3D12Heap> heap;
+        ComPtr<ID3D12Resource> resource;
+        CUexternalMemory extMem = nullptr;
+        CUdeviceptr devPtr = 0;
+        HANDLE sharedHandle = nullptr;
+        uint64_t heapSize = 0;    // actual heap size (64KB aligned)
+        uint64_t dataSize = 0;    // usable data capacity
+    } staging;
 };
 
 struct CUDAInterop {
@@ -403,8 +422,116 @@ DSLoaderHandle ds_loader_create() {
     return loader;
 }
 
+static void DestroyStagingBuffer(DSLoader* loader) {
+    if (!loader) return;
+    if (g_cudaInitialized) {
+        g_cuCtxSetCurrent(g_cudaContext);
+        if (loader->staging.devPtr) {
+            g_cuMemFree(loader->staging.devPtr);
+            loader->staging.devPtr = 0;
+        }
+        if (loader->staging.extMem) {
+            g_cuDestroyExternalMemory(loader->staging.extMem);
+            loader->staging.extMem = nullptr;
+        }
+    }
+    if (loader->staging.sharedHandle) {
+        CloseHandle(loader->staging.sharedHandle);
+        loader->staging.sharedHandle = nullptr;
+    }
+    loader->staging.resource.Reset();
+    loader->staging.heap.Reset();
+    loader->staging.heapSize = 0;
+    loader->staging.dataSize = 0;
+}
+
+static bool EnsureStagingBuffer(DSLoader* loader, uint64_t minSize) {
+    if (!loader || minSize == 0) return false;
+    if (loader->staging.dataSize >= minSize) return true;  // already big enough
+
+    if (!EnsureCudaLoaded()) return false;
+
+    // Destroy old staging buffer if it exists
+    DestroyStagingBuffer(loader);
+
+    // Align heap size to 64KB
+    uint64_t heapSize = (minSize + 65535) & ~65535ULL;
+
+    // Create shared D3D12 heap
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = heapSize;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Properties.CreationNodeMask = 1;
+    hd.Properties.VisibleNodeMask = 1;
+    hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED |
+               D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES |
+               D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES);
+
+    HRESULT hr = loader->device->CreateHeap(&hd, IID_PPV_ARGS(&loader->staging.heap));
+    if (FAILED(hr)) { g_lastHR = hr; return false; }
+
+    // Create placed resource on the shared heap
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd.Width = minSize;
+    rd.Height = 1;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels = 1;
+    rd.Format = DXGI_FORMAT_UNKNOWN;
+    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd.SampleDesc.Count = 1;
+    rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    hr = loader->device->CreatePlacedResource(
+        loader->staging.heap.Get(), 0, &rd,
+        D3D12_RESOURCE_STATE_COMMON, nullptr,
+        IID_PPV_ARGS(&loader->staging.resource));
+    if (FAILED(hr)) { g_lastHR = hr; DestroyStagingBuffer(loader); return false; }
+
+    // Create shared NT handle from the heap
+    hr = loader->device->CreateSharedHandle(
+        loader->staging.heap.Get(), nullptr, GENERIC_ALL, nullptr,
+        &loader->staging.sharedHandle);
+    if (FAILED(hr)) { g_lastHR = hr; DestroyStagingBuffer(loader); return false; }
+
+    // Import into CUDA
+    g_cuCtxSetCurrent(g_cudaContext);
+
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC_v1 memDesc = {};
+    memDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP;
+    memDesc.handle.win32.handle = loader->staging.sharedHandle;
+    memDesc.size = heapSize;
+    memDesc.flags = 0;
+
+    CUresult cr = g_cuImportExternalMemory(&loader->staging.extMem, &memDesc);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCA000000 | (cr & 0xFFFF));
+        DestroyStagingBuffer(loader);
+        return false;
+    }
+
+    // Map to CUDA device pointer
+    CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1 bufDesc = {};
+    bufDesc.offset = 0;
+    bufDesc.size = minSize;
+    bufDesc.flags = 0;
+
+    cr = g_cuExternalMemoryGetMappedBuffer(&loader->staging.devPtr, loader->staging.extMem, &bufDesc);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCB000000 | (cr & 0xFFFF));
+        DestroyStagingBuffer(loader);
+        return false;
+    }
+
+    loader->staging.heapSize = heapSize;
+    loader->staging.dataSize = minSize;
+    return true;
+}
+
 void ds_loader_destroy(DSLoaderHandle loader) {
     if (loader) {
+        DestroyStagingBuffer(loader);
         if (loader->asyncEvent) CloseHandle(loader->asyncEvent);
         delete loader;
     }
@@ -1032,6 +1159,93 @@ int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, uint64_
     return 0;
 }
 
+// --- Stream file data directly to a CUDA device pointer ---
+// Uses a reusable staging buffer (D3D12 shared heap + CUDA interop).
+// Path: SSD -> DirectStorage DMA -> staging GPU buffer -> cuMemcpyDtoD -> dest CUDA ptr
+// Zero CPU copies. Zero Go allocations.
+int ds_loader_stream_to_cuda(
+    DSLoaderHandle loader,
+    const wchar_t* file_path,
+    uint64_t file_offset,
+    uint64_t size,
+    uint64_t cuda_dest_ptr
+) {
+    if (!loader || !file_path || size == 0 || cuda_dest_ptr == 0) return -1;
+    if (!EnsureCudaLoaded()) { g_lastHR = E_FAIL; return -1; }
+
+    // Step 1: Ensure staging buffer is large enough
+    if (!EnsureStagingBuffer(loader, size)) return -1;
+
+    // Step 2: Load file data into staging buffer via DirectStorage
+    ComPtr<IDStorageFile> file;
+    HRESULT hr = loader->factory->OpenFile(file_path, IID_PPV_ARGS(&file));
+    if (FAILED(hr)) { g_lastHR = hr; return -1; }
+
+    uint64_t remaining = size;
+    uint64_t bufferOffset = 0;
+    while (remaining > 0) {
+        uint32_t chunkSize = (remaining > DS_MAX_CHUNK_SIZE)
+            ? (uint32_t)DS_MAX_CHUNK_SIZE
+            : (uint32_t)remaining;
+
+        DSTORAGE_REQUEST request = {};
+        request.Options.SourceType = DSTORAGE_REQUEST_SOURCE_FILE;
+        request.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_BUFFER;
+        request.Source.File.Source = file.Get();
+        request.Source.File.Offset = file_offset + bufferOffset;
+        request.Source.File.Size = chunkSize;
+        request.UncompressedSize = chunkSize;
+        request.Destination.Buffer.Resource = loader->staging.resource.Get();
+        request.Destination.Buffer.Offset = bufferOffset;
+        request.Destination.Buffer.Size = chunkSize;
+
+        loader->queue->EnqueueRequest(&request);
+        bufferOffset += chunkSize;
+        remaining -= chunkSize;
+    }
+
+    hr = SubmitAndWait(loader->queue.Get(), loader->device.Get());
+    if (FAILED(hr)) { g_lastHR = hr; return -1; }
+
+    // Step 3: Device-to-device copy from staging CUDA ptr to destination
+    g_cuCtxSetCurrent(g_cudaContext);
+    CUresult cr = g_cuMemcpyDtoD((CUdeviceptr)cuda_dest_ptr, loader->staging.devPtr, (size_t)size);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCD000000 | (cr & 0xFFFF));
+        return -1;
+    }
+
+    return 0;
+}
+
+// --- CUDA memory allocation (for testing) ---
+uint64_t ds_loader_cuda_alloc(uint64_t size) {
+    if (!EnsureCudaLoaded() || size == 0) return 0;
+    g_cuCtxSetCurrent(g_cudaContext);
+    CUdeviceptr ptr = 0;
+    CUresult cr = g_cuMemAlloc(&ptr, (size_t)size);
+    if (cr != CUDA_SUCCESS) return 0;
+    return (uint64_t)ptr;
+}
+
+void ds_loader_cuda_free(uint64_t ptr) {
+    if (!g_cudaInitialized || ptr == 0) return;
+    g_cuCtxSetCurrent(g_cudaContext);
+    g_cuMemFree((CUdeviceptr)ptr);
+}
+
+// Copy from a raw CUDA device pointer to host memory (for testing StreamToCuda)
+int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size) {
+    if (!g_cudaInitialized || src_cuda_ptr == 0 || !dest || size == 0) return -1;
+    g_cuCtxSetCurrent(g_cudaContext);
+    CUresult cr = g_cuMemcpyDtoH(dest, (CUdeviceptr)src_cuda_ptr, (size_t)size);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    return 0;
+}
+
 void ds_loader_cuda_destroy(CUDAInteropHandle interop) {
     if (!interop) return;
 
@@ -1090,6 +1304,11 @@ CUDAInteropHandle ds_loader_export_to_cuda(DSLoaderHandle loader,
 uint64_t ds_loader_cuda_get_device_ptr(CUDAInteropHandle interop) { return 0; }
 int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, uint64_t size) { return -1; }
 void ds_loader_cuda_destroy(CUDAInteropHandle interop) {}
+int ds_loader_stream_to_cuda(DSLoaderHandle loader, const wchar_t* file_path,
+                              uint64_t file_offset, uint64_t size, uint64_t cuda_dest_ptr) { return -1; }
+uint64_t ds_loader_cuda_alloc(uint64_t size) { return 0; }
+void ds_loader_cuda_free(uint64_t ptr) {}
+int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size) { return -1; }
 
 } // extern "C"
 

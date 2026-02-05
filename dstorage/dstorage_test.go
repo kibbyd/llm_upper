@@ -722,6 +722,149 @@ func TestCudaInterop_1MB(t *testing.T) {
 	}
 }
 
+// --- Stream-to-CUDA tests (the integration path) ---
+
+func TestStreamToCuda_64KB(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	size := uint64(64 * 1024)
+	path, expected := createTestFile(t, int(size))
+
+	// Allocate a CUDA device buffer (simulates ggml_tensor->data from cudaMalloc)
+	cudaPtr := CudaAlloc(size)
+	if cudaPtr == 0 {
+		t.Fatal("CudaAlloc failed")
+	}
+	defer CudaFree(cudaPtr)
+	t.Logf("CUDA dest buffer: 0x%X", cudaPtr)
+
+	// Stream file data: SSD -> DirectStorage -> staging -> cuMemcpyDtoD -> cudaPtr
+	err = loader.StreamToCuda(path, 0, size, cudaPtr)
+	if err != nil {
+		t.Fatalf("StreamToCuda failed: %v", err)
+	}
+
+	// Read back from CUDA device pointer and verify byte-perfect
+	result := make([]byte, size)
+	err = CudaDtoH(cudaPtr, result)
+	if err != nil {
+		t.Fatalf("CudaDtoH readback failed: %v", err)
+	}
+
+	if !bytes.Equal(expected, result) {
+		t.Error("DATA MISMATCH! StreamToCuda 64KB roundtrip FAILED")
+		for i := range expected {
+			if expected[i] != result[i] {
+				t.Errorf("First diff at byte %d: expected 0x%02X, got 0x%02X", i, expected[i], result[i])
+				break
+			}
+		}
+	} else {
+		t.Log("StreamToCuda 64KB: SSD -> DMA -> staging -> DtoD -> cudaMalloc ptr -> DtoH: VERIFIED!")
+	}
+}
+
+func TestStreamToCuda_1MB(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	size := uint64(1024 * 1024)
+	path, expected := createTestFile(t, int(size))
+
+	cudaPtr := CudaAlloc(size)
+	if cudaPtr == 0 {
+		t.Fatal("CudaAlloc failed")
+	}
+	defer CudaFree(cudaPtr)
+
+	err = loader.StreamToCuda(path, 0, size, cudaPtr)
+	if err != nil {
+		t.Fatalf("StreamToCuda 1MB failed: %v", err)
+	}
+
+	result := make([]byte, size)
+	err = CudaDtoH(cudaPtr, result)
+	if err != nil {
+		t.Fatalf("CudaDtoH readback failed: %v", err)
+	}
+
+	if !bytes.Equal(expected, result) {
+		t.Error("1MB StreamToCuda roundtrip FAILED")
+	} else {
+		t.Log("StreamToCuda 1MB: SSD -> DMA -> staging -> DtoD -> CUDA ptr: VERIFIED!")
+	}
+}
+
+func TestStreamToCuda_Throughput(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	sizes := []int{
+		64 * 1024,        // 64KB
+		1024 * 1024,      // 1MB
+		16 * 1024 * 1024, // 16MB
+	}
+
+	for _, size := range sizes {
+		path, _ := createTestFile(t, size)
+
+		cudaPtr := CudaAlloc(uint64(size))
+		if cudaPtr == 0 {
+			t.Fatalf("CudaAlloc(%d) failed", size)
+		}
+
+		// Warm up
+		loader.StreamToCuda(path, 0, uint64(size), cudaPtr)
+
+		iterations := 5
+		start := time.Now()
+		for i := 0; i < iterations; i++ {
+			err = loader.StreamToCuda(path, 0, uint64(size), cudaPtr)
+			if err != nil {
+				t.Fatalf("StreamToCuda failed: %v", err)
+			}
+		}
+		elapsed := time.Since(start)
+		CudaFree(cudaPtr)
+
+		avgTime := elapsed / time.Duration(iterations)
+		mbPerSec := float64(size) / (1024 * 1024) / avgTime.Seconds()
+		t.Logf("StreamToCuda %s: avg %v per tensor, %.1f MB/s",
+			formatSize(size), avgTime, mbPerSec)
+	}
+}
+
 func TestCudaInterop_BatchedWithPrefetch(t *testing.T) {
 	if !IsAvailable() {
 		t.Skip("DirectStorage not available")

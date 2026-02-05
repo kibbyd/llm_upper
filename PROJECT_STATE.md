@@ -167,6 +167,7 @@ Key insight from the research document (`idea.md`):
 | `idea.md` | The five problems defined, what solving them enables, the relationship between streaming and MoE |
 | `DIRECTSTORAGE_LLM_RESEARCH.md` | Hardware specs, measured SSD speeds, DirectStorage API overview, architecture diagram |
 | `PROJECT_STATE.md` | THIS FILE — complete project documentation |
+| `ollama-patches/ggml.go` | Patched copy of `ml/backend/ggml/ggml.go` with DirectStorage integration in `Backend.Load()`. This file goes at `C:\Users\danie\Documents\ollama\ml\backend\ggml\ggml.go`. |
 
 ### DirectStorage Module (in `C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage\`)
 
@@ -176,12 +177,12 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `native/dstorage_loader.h` | 172 | C header defining the DLL's exported API (23 functions). Uses `DS_API` macro for `__declspec(dllexport)` when `DSTORAGE_EXPORTS` is defined, `__declspec(dllimport)` otherwise. Includes `CUDAInteropHandle` typedef and 6 CUDA interop function declarations. |
-| `native/dstorage_loader.cpp` | ~1037 | C++ implementation of the DirectStorage operations. Compiled with MSVC (cl.exe) into `dstorage_loader.dll`. Contains all D3D12 and DirectStorage COM code including batched reads with file handle caching, CUDA driver API dynamic loading (nvcuda.dll), D3D12-CUDA interop via `cuImportExternalMemory`, and LUID-based GPU adapter matching. |
+| `native/dstorage_loader.h` | 199 | C header defining the DLL's exported API (27 functions). Uses `DS_API` macro for `__declspec(dllexport)` when `DSTORAGE_EXPORTS` is defined, `__declspec(dllimport)` otherwise. Includes `CUDAInteropHandle` typedef, 6 CUDA interop function declarations, and 4 StreamToCuda function declarations. |
+| `native/dstorage_loader.cpp` | ~1316 | C++ implementation of the DirectStorage operations. Compiled with MSVC (cl.exe) into `dstorage_loader.dll`. Contains all D3D12 and DirectStorage COM code including batched reads with file handle caching, CUDA driver API dynamic loading (nvcuda.dll), D3D12-CUDA interop via `cuImportExternalMemory`, LUID-based GPU adapter matching, reusable staging buffer for StreamToCuda, and cuMemcpyDtoD for device-to-device copies. |
 | `native/diagnose.go` | 148 | Standalone Go diagnostic tool (has `//go:build ignore` tag, not part of the package). Run with `go run native/diagnose.go`. Checks Windows version, D3D12, DirectStorage DLL loading, and calls `ds_loader_available()`. |
-| `dstorage_windows.go` | 598 | Go bindings for Windows. Loads `dstorage_loader.dll` via `syscall.LoadDLL` (no CGO). Exposes the Go-level API: `Loader`, `GPUBuffer`, `CUDAInterop`, `IsAvailable()`, `NewLoader()`, `LoadBlock()`, `ReadToMemory()`, `GPUReadback()`, `IsCudaAvailable()`, `CreateSharedGPUBuffer()`, `ExportToCuda()`, etc. Build tag: `//go:build windows` |
-| `dstorage_stub.go` | ~80 | Stub implementation for non-Windows platforms. All functions return `ErrNotAvailable`. Includes CUDA interop stubs. Build tag: `//go:build !windows` |
-| `dstorage_test.go` | 811 | Comprehensive test suite. 21 tests covering availability, loader lifecycle, SSD-to-CPU reads (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips (4KB, 1MB), throughput benchmarks, shared heap diagnostics, CUDA availability, shared GPU buffer lifecycle, CUDA interop export+readback (64KB, 1MB), and batched CUDA interop (4x1MB). All tests pass. |
+| `dstorage_windows.go` | 677 | Go bindings for Windows. Loads `dstorage_loader.dll` via `syscall.LoadDLL` (no CGO). Exposes the Go-level API: `Loader`, `GPUBuffer`, `CUDAInterop`, `IsAvailable()`, `NewLoader()`, `LoadBlock()`, `ReadToMemory()`, `GPUReadback()`, `IsCudaAvailable()`, `CreateSharedGPUBuffer()`, `ExportToCuda()`, `StreamToCuda()`, `CudaAlloc()`, `CudaFree()`, `CudaDtoH()`, etc. Build tag: `//go:build windows` |
+| `dstorage_stub.go` | 103 | Stub implementation for non-Windows platforms. All functions return `ErrNotAvailable`. Includes CUDA interop and StreamToCuda stubs. Build tag: `//go:build !windows` |
+| `dstorage_test.go` | ~870 | Comprehensive test suite. 24 tests covering availability, loader lifecycle, SSD-to-CPU reads (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips (4KB, 1MB), throughput benchmarks, shared heap diagnostics, CUDA availability, shared GPU buffer lifecycle, CUDA interop export+readback (64KB, 1MB), batched CUDA interop (4x1MB), StreamToCuda (64KB, 1MB), and StreamToCuda throughput. All tests pass. |
 | `build.ps1` | 117 | PowerShell build script. Compiles C++ with cl.exe, links DLL with link.exe, then runs `go build` and `go test`. This is the primary build mechanism. |
 | `build.bat` | ~60 | Older CMD build script. Less reliable than build.ps1. Kept for reference but build.ps1 should be used instead. |
 
@@ -266,7 +267,8 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 ┌─────────────────────────────────────────────────────────┐
 │           dstorage_loader.dll (C++, compiled by MSVC)    │
 │                                                          │
-│   23 exports: DirectStorage ops (17) + CUDA interop (6)  │
+│   27 exports: DirectStorage ops (17) + CUDA interop (6)  │
+│                + StreamToCuda (4)                         │
 │                                                          │
 │   LUID matching: On create, queries CUDA device LUID     │
 │   via cuDeviceGetLuid, then creates D3D12 device on      │
@@ -319,6 +321,34 @@ SSD file → DirectStorage DMA → Placed D3D12 Resource on Shared Heap → CUDA
                                     CreateSharedHandle(heap)        → CUdeviceptr
 ```
 
+### StreamToCuda Data Flow (The Ollama Integration Path)
+
+```
+SSD file → DirectStorage DMA → Reusable Staging Buffer → cuMemcpyDtoD → ggml_tensor->data (CUDA ptr)
+                                      │                        │
+                              D3D12 shared heap          CUDA device ptr
+                              (auto-grows as needed)     (from cuImportExternalMemory)
+                              persists for loader lifetime
+```
+
+### Ollama Load() Integration Data Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  Backend.Load() in ggml.go                                          │
+│                                                                      │
+│  For each tensor in GGUF file:                                       │
+│    ├─ MXFP4 tensor? → byte reordering → ggml_backend_tensor_set()  │
+│    ├─ BF16→F32?     → type conversion → ggml_backend_tensor_set()  │
+│    └─ Standard tensor:                                               │
+│        ├─ All targets GPU + DirectStorage available?                │
+│        │   YES → dsLoader.StreamToCuda(path, offset, size, cudaPtr)│
+│        │         (SSD → DMA → staging → DtoD → tensor->data)      │
+│        └─ NO  → io.ReadFull(128KB) → ggml_backend_tensor_set()    │
+│                 (SSD → CPU heap → cudaMemcpyHostToDevice)          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 ### Critical Design Decision: No CGO
 
 We deliberately avoid CGO because:
@@ -338,7 +368,7 @@ Our DLL does NOT statically link to `dstorage.lib`. Instead, it uses `LoadLibrar
 
 ## 6. THE NATIVE C API
 
-These are the 23 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
+These are the 27 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
 
 ### `int ds_loader_available()`
 Checks if DirectStorage is usable on this system. Internally:
@@ -483,6 +513,28 @@ Destroys a CUDA interop handle:
 3. Closes the shared NT handle
 4. Deletes the `CUDAInterop` struct
 
+### `int ds_loader_stream_to_cuda(DSLoaderHandle loader, const wchar_t* file_path, uint64_t file_offset, uint64_t size, uint64_t cuda_dest_ptr)`
+**THE main integration function for Ollama.** Loads file data directly to a CUDA device pointer in one call. Zero CPU copies. Zero Go allocations.
+- `cuda_dest_ptr`: A `CUdeviceptr` (e.g., from `ggml_tensor->data` or `cuMemAlloc`). This is the final destination.
+- Internally uses a reusable staging buffer (D3D12 shared heap + CUDA interop):
+  1. `EnsureStagingBuffer()` creates/grows the staging buffer if needed (D3D12 shared heap → placed resource → CUDA import → device pointer)
+  2. DirectStorage DMA: file → staging GPU buffer (with auto-chunking for >32MB)
+  3. `cuMemcpyDtoD`: staging CUDA ptr → destination CUDA ptr
+- The staging buffer persists for the loader's lifetime, is reused across calls, and auto-grows when a larger tensor is encountered
+- Returns 0 on success, -1 on failure
+- Error codes: `0xCD` prefix = `cuMemcpyDtoD` failure
+
+### `uint64_t ds_loader_cuda_alloc(uint64_t size)`
+Allocates CUDA device memory via `cuMemAlloc_v2`. Returns `CUdeviceptr` as `uint64`, or 0 on failure. Used for testing `stream_to_cuda`.
+
+### `void ds_loader_cuda_free(uint64_t ptr)`
+Frees CUDA device memory allocated by `ds_loader_cuda_alloc`. Wraps `cuMemFree_v2`.
+
+### `int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size)`
+Copies data from a raw CUDA device pointer to host memory via `cuMemcpyDtoH_v2`. Used for testing/verification. Unlike `ds_loader_cuda_memcpy_to_host`, this takes a raw `CUdeviceptr` instead of a `CUDAInteropHandle`.
+- Returns 0 on success, -1 on failure
+- Error codes: `0xCE` prefix = `cuMemcpyDtoH` failure
+
 ---
 
 ## 7. THE GO API
@@ -571,6 +623,17 @@ func (l *Loader) ExportToCuda(gpuBuffer *GPUBuffer) (*CUDAInterop, error) // Exp
 func (ci *CUDAInterop) DevicePtr() uint64     // Returns CUDA device pointer (CUdeviceptr)
 func (ci *CUDAInterop) MemcpyToHost(dest []byte) error // GPU -> CPU copy via CUDA
 func (ci *CUDAInterop) Destroy()              // Release CUDA resources
+
+// Stream-to-CUDA API (the integration function for Ollama)
+func (l *Loader) StreamToCuda(filePath string, fileOffset uint64, size uint64, cudaDestPtr uint64) error
+    // Loads file data directly to a CUDA device pointer in one call.
+    // SSD → DirectStorage DMA → staging → cuMemcpyDtoD → cudaDestPtr
+    // This replaces Ollama's io.ReadFull + cudaMemcpyHostToDevice loop.
+
+// Testing helpers
+func CudaAlloc(size uint64) uint64           // cuMemAlloc wrapper
+func CudaFree(ptr uint64)                    // cuMemFree wrapper
+func CudaDtoH(srcCudaPtr uint64, dest []byte) error // cuMemcpyDtoH wrapper
 ```
 
 ### DLL Search Path
@@ -580,7 +643,7 @@ When the Go code loads `dstorage_loader.dll`, it searches these locations in ord
 2. Next to the Go source file (using `runtime.Caller(0)`)
 3. Current working directory: `dstorage_loader.dll`
 
-The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 24 proc addresses are resolved at load time.
+The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 28 proc addresses are resolved at load time.
 
 ---
 
@@ -790,6 +853,16 @@ Standard I/O reads from OS page cache (file already in RAM). DirectStorage bypas
 
 **Data verification:** 1MB of the model file was read via standard I/O, DirectStorage-to-CPU, and DirectStorage-to-GPU-to-CPU roundtrip. All three produced identical bytes.
 
+### Test 3: StreamToCuda (End-to-End SSD → CUDA Device Pointer)
+
+These tests use `StreamToCuda()` — the complete path from SSD to a `cuMemAlloc`'d CUDA device pointer:
+
+| Size | Avg Time | Throughput |
+|------|----------|------------|
+| 64KB | 2.4ms | 26 MB/s |
+| 1MB | 2.3ms | 429 MB/s |
+| 16MB | 7.3ms | 2,207 MB/s |
+
 ### Analysis
 
 1. Standard I/O appears faster because it reads from the OS page cache (RAM), not from SSD. DirectStorage always reads from SSD (bypasses the cache).
@@ -924,9 +997,31 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - `ds_loader_cuda_get_device_ptr()`, `ds_loader_cuda_memcpy_to_host()`, `ds_loader_cuda_destroy()`: Device pointer access, GPU→CPU copy for verification, cleanup
     - **LUID matching in `ds_loader_create()`**: Queries CUDA device's LUID via `cuDeviceGetLuid`, creates `IDXGIFactory4` via `CreateDXGIFactory2`, finds matching adapter via `EnumAdapterByLuid`, creates D3D12 device on that adapter. This fixed `CUDA_ERROR_OPERATING_SYSTEM` (304) error caused by D3D12 picking Intel iGPU while CUDA was on NVIDIA dGPU.
     - Hardware constraint discovered: `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` cannot be used with placed resources on shared heaps; `CreateCommittedResource` with `D3D12_HEAP_FLAG_SHARED` always fails with `E_INVALIDARG` on this hardware
-    - DLL now exports 23 functions total (17 original + 6 CUDA interop)
-    - All 21 tests pass including 3 new CUDA interop tests (64KB, 1MB, 4MB batched)
+    - DLL exports grew to 23 functions (17 original + 6 CUDA interop)
+    - All 21 tests passed including 3 new CUDA interop tests (64KB, 1MB, 4MB batched)
     - SSD → DirectStorage → D3D12 shared buffer → CUDA device pointer → CPU readback: byte-perfect match verified
+
+16. **StreamToCuda — The Ollama Integration Function** — Added `ds_loader_stream_to_cuda()` which does the complete SSD→CUDA transfer in one call. Zero CPU copies. Zero Go allocations. Uses a reusable staging buffer (D3D12 shared heap + CUDA interop) that auto-grows as needed. Data flow: SSD → DirectStorage DMA → staging GPU buffer → `cuMemcpyDtoD` → destination CUDA ptr. Added 4 new C++ exports and Go bindings:
+    - `ds_loader_stream_to_cuda()`: The main integration function
+    - `ds_loader_cuda_alloc()`, `ds_loader_cuda_free()`: `cuMemAlloc`/`cuMemFree` wrappers for testing
+    - `ds_loader_cuda_dtoh()`: `cuMemcpyDtoH` for raw CUDA ptr (testing verification)
+    - New CUDA driver API functions loaded from nvcuda.dll: `cuMemcpyDtoD_v2`, `cuMemAlloc_v2`
+    - DLL now exports 27 functions total (23 + 4 StreamToCuda)
+    - All 24 tests pass (21 previous + 3 new StreamToCuda tests)
+    - Throughput: 64KB=26 MB/s, 1MB=429 MB/s, 16MB=2,207 MB/s (near SSD max)
+
+17. **Ollama Backend.Load() Integration** — Modified `ml/backend/ggml/ggml.go` to use DirectStorage for CUDA-bound tensors:
+    - Imports `github.com/ollama/ollama/ml/backend/ggml/dstorage`
+    - At start of `Load()`: checks `dstorage.IsAvailable() && dstorage.IsCudaAvailable()`, creates a `dstorage.Loader` if available
+    - For each tensor in the standard path (NOT MXFP4 or BF16 special cases):
+      - Checks if ALL target buffers are non-host (GPU) via `C.ggml_backend_buffer_is_host()`
+      - If all GPU: calls `dsLoader.StreamToCuda(modelPath, fileOffset, size, cudaPtr)` for each target
+      - If any CPU or DirectStorage fails: falls through to existing 128KB chunk path (zero risk of regression)
+    - Serializes DirectStorage calls via `sync.Mutex` (single staging buffer)
+    - Reports progress per tensor for DirectStorage path, per 128KB chunk for standard path
+    - Logs summary on completion: "DirectStorage: streamed N GPU tensors (X MB) via SSD → GPU bypass"
+    - Modified file: `ollama-patches/ggml.go` (copy of patched Ollama source)
+    - Compiles cleanly: `go build github.com/ollama/ollama/ml/backend/ggml` succeeds
 
 ---
 
@@ -940,7 +1035,7 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 4. ~~**D3D12-CUDA interop**~~ — **DONE.** See Section 13, item 15. Full D3D12-CUDA memory sharing with LUID matching, shared heaps, and CUDA device pointers. Verified byte-perfect across 21 tests.
 
-5. **Ollama integration** — No modifications to Ollama's model loading code. The dstorage package exists in the Ollama source tree but nothing references it.
+5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-17. `Backend.Load()` in `ggml.go` now uses `StreamToCuda` for GPU-bound tensors. Compiles cleanly. Not yet tested end-to-end with a full Ollama build (requires CUDA SDK + CMake build toolchain).
 
 6. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
 
@@ -966,14 +1061,19 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 Implemented full D3D12-CUDA memory sharing with LUID matching, shared heaps, CUDA device pointers, and cleanup. All 21 tests pass. See Section 13, item 15.
 
-### Priority 1 (current): Ollama Integration
+### ~~Priority 1: Ollama Integration~~ — DONE
 
-The streamer can now replace Ollama's standard model loading path for models that exceed VRAM. The data path is:
-1. SSD → DirectStorage DMA → D3D12 shared buffer (via `CreateSharedGPUBuffer`)
-2. D3D12 shared buffer → CUDA device pointer (via `ExportToCuda`)
-3. CUDA device pointer → GGML compute (cast to `float*`)
+Implemented `StreamToCuda` function and integrated into `Backend.Load()`. See Section 13, items 16-17.
 
-The integration point is `ml/backend/ggml/ggml.go` where `Backend.Load()` loads tensors. The streamer needs to be updated to use `CreateSharedGPUBuffer` instead of `CreateGPUBuffer`, and the CUDA device pointers need to be wired into GGML's tensor data pointers.
+### Priority 1 (current): End-to-End Testing with Real Model
+
+Build Ollama with the DirectStorage integration and test with deepseek-r1:7b:
+1. Set up the full Ollama build toolchain (CMake, CUDA SDK, etc.)
+2. Build Ollama with the patched `ggml.go`
+3. Run `ollama run deepseek-r1:7b` and verify:
+   - Model loads correctly (check "DirectStorage: streamed N GPU tensors" log)
+   - Inference produces correct output
+   - Loading time is comparable or faster than baseline
 
 ### Priority 2: Streamer CUDA Integration
 
@@ -996,3 +1096,5 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Implemented file handle caching + request batching — 4 new C++ exports, Go bindings, streamer batched path. Full model loads in 4.86s at 962 MB/s (14.5% improvement).
 - 2026-02-05: Implemented async prefetching — 3 new C++ exports (async submit/poll/wait), Go bindings, streamer auto-prefetch of next layer. I/O wait reduced 73% (5.43s→1.46s), total time reduced 48% (8.25s→4.27s) with 100ms simulated compute. DLL now exports 17 functions.
 - 2026-02-05: Implemented D3D12-CUDA interop — 6 new C++ exports (cuda_available, create_shared_gpu_buffer, export_to_cuda, cuda_get_device_ptr, cuda_memcpy_to_host, cuda_destroy). Dynamic nvcuda.dll loading, shared heap creation, cuImportExternalMemory with D3D12_HEAP type. Fixed GPU device mismatch (Bug 5) via LUID matching. DLL now exports 23 functions. All 21 tests pass including SSD→D3D12→CUDA→CPU byte-perfect roundtrip.
+- 2026-02-05: Implemented StreamToCuda — 4 new C++ exports (stream_to_cuda, cuda_alloc, cuda_free, cuda_dtoh). Reusable staging buffer with auto-grow. cuMemcpyDtoD for device-to-device. DLL now exports 27 functions. All 24 tests pass. Throughput: 2,207 MB/s at 16MB.
+- 2026-02-05: Ollama Backend.Load() integration — Modified ggml.go to import dstorage package, detect GPU tensors via ggml_backend_buffer_is_host(), call StreamToCuda for CUDA-bound tensors with fallback to standard I/O. Compiles cleanly. Patched file saved to ollama-patches/ggml.go.

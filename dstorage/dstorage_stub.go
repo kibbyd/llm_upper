@@ -92,3 +92,11 @@ func (l *Loader) ExportToCuda(gpuBuffer *GPUBuffer) (*CUDAInterop, error) {
 func (ci *CUDAInterop) DevicePtr() uint64              { return 0 }
 func (ci *CUDAInterop) MemcpyToHost(dest []byte) error { return ErrNotAvailable }
 func (ci *CUDAInterop) Destroy()                       {}
+
+// --- Stream-to-CUDA stubs ---
+func (l *Loader) StreamToCuda(filePath string, fileOffset uint64, size uint64, cudaDestPtr uint64) error {
+	return ErrNotAvailable
+}
+func CudaAlloc(size uint64) uint64                  { return 0 }
+func CudaFree(ptr uint64)                           {}
+func CudaDtoH(srcCudaPtr uint64, dest []byte) error { return ErrNotAvailable }
