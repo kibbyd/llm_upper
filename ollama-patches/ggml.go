@@ -494,10 +494,8 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 	}
 	slog.Info(fmt.Sprintf("offloaded %d/%d layers to GPU", gpuLayers, len(b.layers)+1))
 
-	// --- DirectStorage integration: stream GPU tensors from SSD bypassing CPU ---
+	// --- DirectStorage integration: batch-stream GPU tensors from SSD bypassing CPU ---
 	var dsLoader *dstorage.Loader
-	var dsMu sync.Mutex // serializes DirectStorage calls (single staging buffer)
-	var dsTensorCount, dsByteCount atomic.Uint64
 	if dstorage.IsAvailable() && dstorage.IsCudaAvailable() {
 		if dl, err := dstorage.NewLoader(0); err == nil {
 			dsLoader = dl
@@ -508,12 +506,105 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 		}
 	}
 
+	// First pass: collect GPU tensors for DirectStorage batch loading.
+	// Tensors needing special handling (MXFP4, BF16) or on CPU go through the standard path.
+	type dsTensorEntry struct {
+		fileOffset  uint64
+		size        uint64
+		cudaDestPtr uint64
+	}
+	var dsEntries []dsTensorEntry
+	dsBatchTensors := make(map[string]bool) // track which tensors are in the DS batch
+
+	if dsLoader != nil {
+		for _, t := range b.meta.Tensors().Items() {
+			// Skip tensors that need special handling (MXFP4 byte reordering, BF16→F32 conversion)
+			if t.Kind == 4 {
+				continue // MXFP4
+			}
+			if strings.HasSuffix(t.Name, "_exps.bias") && t.Kind == 30 {
+				continue // BF16
+			}
+
+			targets := b.tensorLoadTargets[t.Name]
+			tts := make([]*C.struct_ggml_tensor, max(1, len(targets)))
+			for i := range tts {
+				target := targets[i]
+				if target == "" {
+					target = t.Name
+				}
+				tt, ok := b.tensors[target]
+				if !ok {
+					continue
+				}
+				tts[i] = tt
+			}
+
+			// Check if ALL targets are GPU (non-host buffers)
+			allGPU := true
+			for _, tt := range tts {
+				if tt == nil || bool(C.ggml_backend_buffer_is_host(tt.buffer)) {
+					allGPU = false
+					break
+				}
+			}
+
+			if allGPU {
+				fileOffset := b.meta.Tensors().Offset + t.Offset
+				tensorSize := t.Size()
+				for _, tt := range tts {
+					cudaPtr := uint64(uintptr(unsafe.Pointer(tt.data)))
+					dsEntries = append(dsEntries, dsTensorEntry{
+						fileOffset:  fileOffset,
+						size:        tensorSize,
+						cudaDestPtr: cudaPtr,
+					})
+				}
+				dsBatchTensors[t.Name] = true
+			}
+		}
+	}
+
+	// Execute DirectStorage batch load if we have GPU tensors
+	var dsTensorCount, dsByteCount uint64
+	if len(dsEntries) > 0 {
+		offsets := make([]uint64, len(dsEntries))
+		sizes := make([]uint64, len(dsEntries))
+		ptrs := make([]uint64, len(dsEntries))
+		for i, e := range dsEntries {
+			offsets[i] = e.fileOffset
+			sizes[i] = e.size
+			ptrs[i] = e.cudaDestPtr
+		}
+
+		if err := dsLoader.StreamToCudaBatch(b.modelPath, offsets, sizes, ptrs); err != nil {
+			slog.Warn("DirectStorage batch load failed, falling back to standard I/O for all tensors", "error", err)
+			dsBatchTensors = nil // clear — all tensors will use standard path
+		} else {
+			dsTensorCount = uint64(len(dsEntries))
+			for _, e := range dsEntries {
+				dsByteCount += e.size
+			}
+		}
+	}
+
 	var doneBytes atomic.Uint64
 	totalBytes := uint64(b.meta.Length) - b.meta.Tensors().Offset
+
+	// Report DirectStorage progress
+	if dsByteCount > 0 && progress != nil {
+		doneBytes.Store(dsByteCount)
+		progress(float32(dsByteCount) / float32(totalBytes))
+	}
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(runtime.GOMAXPROCS(0))
 	for _, t := range b.meta.Tensors().Items() {
+		// Skip tensors already loaded by DirectStorage batch
+		if dsBatchTensors[t.Name] {
+			continue
+		}
+
 		g.Go(func() error {
 			tts := make([]*C.struct_ggml_tensor, max(1, len(b.tensorLoadTargets[t.Name])))
 			for i := range tts {
@@ -609,81 +700,30 @@ func (b *Backend) Load(ctx context.Context, progress func(float32)) error {
 				return nil
 			}
 
-			// --- DirectStorage fast path: stream GPU tensors directly from SSD ---
-			// For each target tensor, check if it's on a GPU buffer.
-			// If DirectStorage is available and the tensor is on GPU, stream via
-			// SSD -> DirectStorage DMA -> staging -> cuMemcpyDtoD -> tensor->data.
-			// CPU targets and fallback cases use the standard 128KB chunk path.
-			dsHandled := false
-			if dsLoader != nil {
-				// Check if ALL targets are GPU (non-host buffers)
-				allGPU := true
+			// Standard path: read 128KB chunks via io.ReadFull + ggml_backend_tensor_set
+			bts := make([]byte, 128*format.KibiByte)
+
+			var s uint64
+			for s < t.Size() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+
+				n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
+				if err != nil {
+					slog.Warn("file read error", "file", b.modelPath, "error", err)
+					return err
+				}
+
 				for _, tt := range tts {
-					if bool(C.ggml_backend_buffer_is_host(tt.buffer)) {
-						allGPU = false
-						break
-					}
+					C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
 				}
 
-				if allGPU {
-					fileOffset := b.meta.Tensors().Offset + t.Offset
-					tensorSize := t.Size()
-					dsOK := true
+				s += uint64(n)
 
-					for _, tt := range tts {
-						cudaPtr := uint64(uintptr(unsafe.Pointer(tt.data)))
-
-						dsMu.Lock()
-						dsErr := dsLoader.StreamToCuda(b.modelPath, fileOffset, tensorSize, cudaPtr)
-						dsMu.Unlock()
-
-						if dsErr != nil {
-							slog.Warn("DirectStorage StreamToCuda failed, falling back to standard I/O",
-								"tensor", t.Name, "size", tensorSize, "error", dsErr)
-							dsOK = false
-							break
-						}
-					}
-
-					if dsOK {
-						dsTensorCount.Add(uint64(len(tts)))
-						dsByteCount.Add(tensorSize * uint64(len(tts)))
-
-						if progress != nil {
-							done := doneBytes.Add(tensorSize)
-							progress(float32(done) / float32(totalBytes))
-						}
-						dsHandled = true
-					}
-				}
-			}
-
-			if !dsHandled {
-				// Standard path: read 128KB chunks via io.ReadFull + ggml_backend_tensor_set
-				bts := make([]byte, 128*format.KibiByte)
-
-				var s uint64
-				for s < t.Size() {
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-
-					n, err := io.ReadFull(sr, bts[:min(len(bts), int(t.Size()-s))])
-					if err != nil {
-						slog.Warn("file read error", "file", b.modelPath, "error", err)
-						return err
-					}
-
-					for _, tt := range tts {
-						C.ggml_backend_tensor_set(tt, unsafe.Pointer(&bts[0]), C.size_t(s), C.size_t(n))
-					}
-
-					s += uint64(n)
-
-					if progress != nil {
-						done := doneBytes.Add(uint64(n))
-						progress(float32(done) / float32(totalBytes))
-					}
+				if progress != nil {
+					done := doneBytes.Add(uint64(n))
+					progress(float32(done) / float32(totalBytes))
 				}
 			}
 
@@ -707,9 +747,9 @@ nextDevice:
 		return err
 	}
 
-	if dsLoader != nil && dsTensorCount.Load() > 0 {
+	if dsTensorCount > 0 {
 		slog.Info(fmt.Sprintf("DirectStorage: streamed %d GPU tensors (%.1f MB) via SSD → GPU bypass",
-			dsTensorCount.Load(), float64(dsByteCount.Load())/(1024*1024)))
+			dsTensorCount, float64(dsByteCount)/(1024*1024)))
 	}
 
 	return nil
