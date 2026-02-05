@@ -28,6 +28,8 @@ func main() {
 	maxLayers := flag.Int("layers", 0, "Number of layers to simulate (0 = all)")
 	listOnly := flag.Bool("list", false, "Only list tensors, don't stream")
 	verify := flag.Bool("verify", false, "Verify data by reading back from GPU")
+	prefetch := flag.Bool("prefetch", false, "Enable async prefetching of next layer during compute")
+	computeMs := flag.Int("compute-ms", 0, "Simulated compute time per layer in ms (for prefetch overlap testing)")
 	flag.Parse()
 
 	if *modelPath == "" {
@@ -148,6 +150,14 @@ func main() {
 	}
 	defer s.Close()
 
+	if *prefetch {
+		s.PrefetchEnabled = true
+		fmt.Println("  Prefetching:     ENABLED (async next-layer prefetch)")
+	} else {
+		fmt.Println("  Prefetching:     disabled (use -prefetch to enable)")
+	}
+	fmt.Println()
+
 	// Simulate loading non-block tensors first (embedding, output norm, etc.)
 	fmt.Println("--- Loading non-block tensors ---")
 	for _, t := range nonBlockTensors {
@@ -166,7 +176,11 @@ func main() {
 
 	// Simulate layer-by-layer inference
 	fmt.Println("--- Simulating layer-by-layer inference ---")
+	if *computeMs > 0 {
+		fmt.Printf("  (simulating %dms compute per layer)\n", *computeMs)
+	}
 	var totalLoadTime time.Duration
+	var totalComputeTime time.Duration
 	var totalBytesLoaded uint64
 	var layerTimes []time.Duration
 
@@ -183,6 +197,7 @@ func main() {
 
 		layerStart := time.Now()
 		// Uses batched DirectStorage: open file once, enqueue all tensors, single submit+wait
+		// If prefetch is enabled, the DMA for this layer may already be in-flight
 		_, err := s.RequestLayerTensors(layer)
 		layerElapsed := time.Since(layerStart)
 
@@ -203,6 +218,14 @@ func main() {
 			fmt.Printf("  evictions=%d", stats.Evictions)
 		}
 		fmt.Println()
+
+		// Simulated compute time — this is where prefetch overlap happens:
+		// while the CPU "computes" (sleeps), the DMA for the next layer runs in the background
+		if *computeMs > 0 {
+			computeStart := time.Now()
+			time.Sleep(time.Duration(*computeMs) * time.Millisecond)
+			totalComputeTime += time.Since(computeStart)
+		}
 	}
 
 	fmt.Println()
@@ -253,7 +276,12 @@ func main() {
 	fmt.Printf("  Bytes evicted:   %s\n", formatBytes(stats.BytesEvicted))
 	fmt.Printf("  VRAM used:       %s / %s\n", formatBytes(stats.VRAMUsed), formatBytes(stats.VRAMBudget))
 	fmt.Printf("  Resident:        %d / %d tensors\n", stats.ResidentTensors, stats.TotalTensors)
-	fmt.Printf("  1st pass time:   %v\n", totalLoadTime)
+	fmt.Printf("  Prefetching:     %v\n", *prefetch)
+	fmt.Printf("  1st pass I/O:    %v (time spent waiting for SSD->GPU)\n", totalLoadTime)
+	if totalComputeTime > 0 {
+		fmt.Printf("  1st pass compute:%v (simulated)\n", totalComputeTime)
+		fmt.Printf("  1st pass total:  %v (I/O + compute)\n", totalLoadTime+totalComputeTime)
+	}
 	fmt.Printf("  2nd pass time:   %v (cache hits)\n", secondPassTime)
 	if totalLoadTime > 0 {
 		fmt.Printf("  Avg throughput:  %.1f MB/s (SSD->GPU)\n",
@@ -262,7 +290,7 @@ func main() {
 
 	// Event log summary
 	events := s.Events()
-	loadCount, evictCount, hitCount := 0, 0, 0
+	loadCount, evictCount, hitCount, prefetchCount := 0, 0, 0, 0
 	for _, e := range events {
 		switch e.Action {
 		case "load":
@@ -271,9 +299,11 @@ func main() {
 			evictCount++
 		case "hit":
 			hitCount++
+		case "prefetch":
+			prefetchCount++
 		}
 	}
-	fmt.Printf("  Events:          %d load, %d evict, %d hit\n", loadCount, evictCount, hitCount)
+	fmt.Printf("  Events:          %d load, %d evict, %d hit, %d prefetch\n", loadCount, evictCount, hitCount, prefetchCount)
 }
 
 // verifyTensor picks a small tensor, reads it via DirectStorage GPU->readback,

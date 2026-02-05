@@ -62,6 +62,9 @@ func (l *Loader) EnqueueRead(fileOffset uint64, size uint64, gpuBuffer *GPUBuffe
 	return ErrNotAvailable
 }
 func (l *Loader) SubmitAndWait() error { return ErrNotAvailable }
+func (l *Loader) Submit() error        { return ErrNotAvailable }
+func (l *Loader) IsComplete() bool     { return true }
+func (l *Loader) WaitComplete() error  { return ErrNotAvailable }
 
 type LoaderConfig struct {
 	DeviceIndex uint32

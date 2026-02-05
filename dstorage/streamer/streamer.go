@@ -108,7 +108,22 @@ type Streamer struct {
 	// events records the last N load/evict/hit events for the demo
 	events []LoadEvent
 
+	// prefetch tracks an in-flight async prefetch for the next layer
+	prefetch *prefetchState
+
+	// Prefetch controls whether automatic prefetching is enabled.
+	// Set to true before calling RequestLayerTensors to enable.
+	PrefetchEnabled bool
+
 	closed bool
+}
+
+// prefetchState tracks an in-flight async prefetch operation.
+type prefetchState struct {
+	blockNum int                            // which layer block was prefetched
+	buffers  map[string]*dstorage.GPUBuffer // tensor name -> allocated GPU buffer
+	tensors  []*gguf.TensorInfo             // which tensors are being loaded
+	bytes    uint64                         // total bytes being prefetched
 }
 
 // entry is an LRU cache entry for a resident tensor.
@@ -172,6 +187,9 @@ func (s *Streamer) Close() error {
 		return nil
 	}
 	s.closed = true
+
+	// Discard any pending prefetch
+	s.discardPrefetch()
 
 	// Release all GPU buffers
 	for name, e := range s.resident {
@@ -282,10 +300,22 @@ func (s *Streamer) RequestTensor(name string) (*dstorage.GPUBuffer, error) {
 	return buf, nil
 }
 
+// missInfo tracks a tensor that needs to be loaded from SSD.
+type missInfo struct {
+	tensor *gguf.TensorInfo
+	buffer *dstorage.GPUBuffer
+}
+
 // RequestLayerTensors loads all tensors for a given layer/block number.
 // Uses batched DirectStorage reads: opens the file once, enqueues all
 // non-resident tensors, submits once, waits once. Already-resident tensors
 // are returned as cache hits without any I/O.
+//
+// If prefetching is enabled (PrefetchEnabled=true), after loading the
+// requested layer, it automatically starts an async prefetch of the
+// next layer (blockNum+1). If a prefetch for the requested block is
+// already in-flight, it waits for that instead of re-reading from SSD.
+//
 // Returns a map of tensor name -> GPU buffer.
 func (s *Streamer) RequestLayerTensors(blockNum int) (map[string]*dstorage.GPUBuffer, error) {
 	tensors := s.model.LayerTensors(blockNum)
@@ -300,13 +330,28 @@ func (s *Streamer) RequestLayerTensors(blockNum int) (map[string]*dstorage.GPUBu
 		return nil, fmt.Errorf("streamer: closed")
 	}
 
+	// Check if we have an in-flight prefetch for this exact block
+	if s.prefetch != nil && s.prefetch.blockNum == blockNum {
+		result, err := s.completePrefetch(tensors)
+		if err != nil {
+			return nil, err
+		}
+		// After completing this layer, start prefetching the next one
+		if s.PrefetchEnabled {
+			s.startPrefetch(blockNum + 1)
+		}
+		return result, nil
+	}
+
+	// If there's a prefetch for a DIFFERENT block, wait+discard it
+	// (the caller skipped ahead or went backwards)
+	if s.prefetch != nil {
+		s.discardPrefetch()
+	}
+
 	result := make(map[string]*dstorage.GPUBuffer, len(tensors))
 
 	// Separate tensors into hits (already resident) and misses (need loading)
-	type missInfo struct {
-		tensor *gguf.TensorInfo
-		buffer *dstorage.GPUBuffer
-	}
 	var misses []missInfo
 
 	for i, t := range tensors {
@@ -328,19 +373,45 @@ func (s *Streamer) RequestLayerTensors(blockNum int) (map[string]*dstorage.GPUBu
 
 	// If all tensors are resident, no I/O needed
 	if len(misses) == 0 {
+		// Still start prefetch for next layer if enabled
+		if s.PrefetchEnabled {
+			s.startPrefetch(blockNum + 1)
+		}
 		return result, nil
 	}
 
-	// Calculate total bytes needed for misses
+	// Load misses synchronously via batched I/O
+	if err := s.loadMissesBatched(misses); err != nil {
+		return nil, err
+	}
+
+	// Register all loaded tensors in the resident set
+	for _, m := range misses {
+		s.registerLoaded(m)
+		result[m.tensor.Name] = m.buffer
+	}
+
+	// Start prefetching next layer
+	if s.PrefetchEnabled {
+		s.startPrefetch(blockNum + 1)
+	}
+
+	return result, nil
+}
+
+// loadMissesBatched performs synchronous batched I/O for the given misses.
+// It creates GPU buffers, opens the file, enqueues all reads, submits, and waits.
+func (s *Streamer) loadMissesBatched(misses []missInfo) error {
+	// Calculate total bytes needed
 	var totalNeeded uint64
 	for _, m := range misses {
 		totalNeeded += m.tensor.ByteSize
 	}
 
-	// Evict until we have room for all misses
+	// Evict until we have room
 	for s.vramUsed+totalNeeded > s.config.VRAMBudget && s.lru.Len() > 0 {
 		if err := s.evictLRU(); err != nil {
-			return nil, fmt.Errorf("streamer: eviction failed: %w", err)
+			return fmt.Errorf("streamer: eviction failed: %w", err)
 		}
 	}
 
@@ -348,73 +419,227 @@ func (s *Streamer) RequestLayerTensors(blockNum int) (map[string]*dstorage.GPUBu
 	for i := range misses {
 		buf, err := s.loader.CreateGPUBuffer(misses[i].tensor.ByteSize)
 		if err != nil {
-			// Clean up already-created buffers
 			for j := 0; j < i; j++ {
 				if misses[j].buffer != nil {
 					s.loader.DestroyGPUBuffer(misses[j].buffer)
 				}
 			}
-			return nil, fmt.Errorf("streamer: create GPU buffer for %q: %w", misses[i].tensor.Name, err)
+			return fmt.Errorf("streamer: create GPU buffer for %q: %w", misses[i].tensor.Name, err)
 		}
 		misses[i].buffer = buf
 	}
 
 	// Batched I/O: open file once, enqueue all, submit once, wait once
-	start := time.Now()
-
 	if err := s.loader.OpenFile(s.config.ModelPath); err != nil {
-		// Clean up buffers
 		for _, m := range misses {
 			s.loader.DestroyGPUBuffer(m.buffer)
 		}
-		return nil, fmt.Errorf("streamer: open file: %w", err)
+		return fmt.Errorf("streamer: open file: %w", err)
 	}
 
 	for _, m := range misses {
 		if err := s.loader.EnqueueRead(m.tensor.FileOffset, m.tensor.ByteSize, m.buffer, 0); err != nil {
-			s.loader.CloseFile()
 			for _, m2 := range misses {
 				s.loader.DestroyGPUBuffer(m2.buffer)
 			}
-			return nil, fmt.Errorf("streamer: enqueue %q: %w", m.tensor.Name, err)
+			return fmt.Errorf("streamer: enqueue %q: %w", m.tensor.Name, err)
 		}
 	}
 
 	if err := s.loader.SubmitAndWait(); err != nil {
-		s.loader.CloseFile()
 		for _, m := range misses {
 			s.loader.DestroyGPUBuffer(m.buffer)
 		}
-		return nil, fmt.Errorf("streamer: submit batch: %w", err)
+		return fmt.Errorf("streamer: submit batch: %w", err)
 	}
 
-	// Don't close the file — it stays cached for the next layer
-	// s.loader.CloseFile()
+	return nil
+}
 
+// registerLoaded adds a loaded tensor to the resident set and LRU.
+func (s *Streamer) registerLoaded(m missInfo) {
+	e := &entry{
+		tensor: m.tensor,
+		buffer: m.buffer,
+	}
+	e.element = s.lru.PushFront(m.tensor.Name)
+	s.resident[m.tensor.Name] = e
+	s.vramUsed += m.tensor.ByteSize
+
+	s.stats.Misses++
+	s.stats.BytesLoaded += m.tensor.ByteSize
+	s.recordEvent(LoadEvent{
+		TensorName: m.tensor.Name,
+		Action:     "load",
+		ByteSize:   m.tensor.ByteSize,
+	})
+}
+
+// startPrefetch begins an async prefetch of the given layer's tensors.
+// Does NOT block — the DMA runs in the background.
+// Must be called with s.mu held.
+func (s *Streamer) startPrefetch(blockNum int) {
+	tensors := s.model.LayerTensors(blockNum)
+	if len(tensors) == 0 {
+		return // no such layer (past the end)
+	}
+
+	// Identify which tensors are NOT already resident
+	var misses []*gguf.TensorInfo
+	var totalNeeded uint64
+	for i, t := range tensors {
+		if _, ok := s.resident[t.Name]; !ok {
+			misses = append(misses, &tensors[i])
+			totalNeeded += t.ByteSize
+		}
+	}
+	if len(misses) == 0 {
+		return // all already resident, nothing to prefetch
+	}
+
+	// Evict to make room for the prefetch
+	for s.vramUsed+totalNeeded > s.config.VRAMBudget && s.lru.Len() > 0 {
+		s.evictLRU()
+	}
+
+	// Allocate GPU buffers
+	buffers := make(map[string]*dstorage.GPUBuffer, len(misses))
+	var prefetchTensors []*gguf.TensorInfo
+	var prefetchBytes uint64
+	for _, ti := range misses {
+		buf, err := s.loader.CreateGPUBuffer(ti.ByteSize)
+		if err != nil {
+			// Failed to allocate — clean up and skip prefetch
+			for _, b := range buffers {
+				s.loader.DestroyGPUBuffer(b)
+			}
+			return
+		}
+		buffers[ti.Name] = buf
+		prefetchTensors = append(prefetchTensors, ti)
+		prefetchBytes += ti.ByteSize
+	}
+
+	// Open file (cached), enqueue all, async submit
+	if err := s.loader.OpenFile(s.config.ModelPath); err != nil {
+		for _, b := range buffers {
+			s.loader.DestroyGPUBuffer(b)
+		}
+		return
+	}
+
+	for _, ti := range prefetchTensors {
+		if err := s.loader.EnqueueRead(ti.FileOffset, ti.ByteSize, buffers[ti.Name], 0); err != nil {
+			for _, b := range buffers {
+				s.loader.DestroyGPUBuffer(b)
+			}
+			return
+		}
+	}
+
+	// Async submit — returns immediately, DMA runs in background
+	if err := s.loader.Submit(); err != nil {
+		for _, b := range buffers {
+			s.loader.DestroyGPUBuffer(b)
+		}
+		return
+	}
+
+	// Track VRAM for the prefetched buffers (they're allocated even if not yet filled)
+	s.vramUsed += prefetchBytes
+
+	s.prefetch = &prefetchState{
+		blockNum: blockNum,
+		buffers:  buffers,
+		tensors:  prefetchTensors,
+		bytes:    prefetchBytes,
+	}
+
+	s.recordEvent(LoadEvent{
+		TensorName: fmt.Sprintf("blk.%d (prefetch started)", blockNum),
+		Action:     "prefetch",
+		ByteSize:   prefetchBytes,
+	})
+}
+
+// completePrefetch waits for the in-flight prefetch to finish, registers
+// the tensors as resident, and returns the result map.
+// Must be called with s.mu held.
+func (s *Streamer) completePrefetch(tensors []gguf.TensorInfo) (map[string]*dstorage.GPUBuffer, error) {
+	pf := s.prefetch
+	s.prefetch = nil
+
+	// Wait for the async DMA to complete
+	start := time.Now()
+	if err := s.loader.WaitComplete(); err != nil {
+		// DMA failed — clean up all buffers and return error
+		for _, b := range pf.buffers {
+			s.loader.DestroyGPUBuffer(b)
+		}
+		s.vramUsed -= pf.bytes
+		return nil, fmt.Errorf("streamer: prefetch wait failed: %w", err)
+	}
 	elapsed := time.Since(start)
 
-	// Register all loaded tensors in the resident set and LRU
-	for _, m := range misses {
+	// Register the prefetched tensors in the resident set
+	for _, ti := range pf.tensors {
+		buf := pf.buffers[ti.Name]
 		e := &entry{
-			tensor: m.tensor,
-			buffer: m.buffer,
+			tensor: ti,
+			buffer: buf,
 		}
-		e.element = s.lru.PushFront(m.tensor.Name)
-		s.resident[m.tensor.Name] = e
-		s.vramUsed += m.tensor.ByteSize
+		e.element = s.lru.PushFront(ti.Name)
+		s.resident[ti.Name] = e
+		// vramUsed was already incremented in startPrefetch
 
 		s.stats.Misses++
-		s.stats.BytesLoaded += m.tensor.ByteSize
+		s.stats.BytesLoaded += ti.ByteSize
 		s.recordEvent(LoadEvent{
-			TensorName: m.tensor.Name,
+			TensorName: ti.Name,
 			Action:     "load",
-			ByteSize:   m.tensor.ByteSize,
-			Duration:   elapsed, // total batch time attributed to each tensor
+			ByteSize:   ti.ByteSize,
+			Duration:   elapsed,
 		})
-		result[m.tensor.Name] = m.buffer
+	}
+
+	// Build result map — includes both prefetched and already-resident tensors
+	result := make(map[string]*dstorage.GPUBuffer, len(tensors))
+	for _, t := range tensors {
+		if e, ok := s.resident[t.Name]; ok {
+			s.lru.MoveToFront(e.element)
+			result[t.Name] = e.buffer
+			// Count as hit only if it was already resident (not just prefetched)
+			if _, wasPrefetched := pf.buffers[t.Name]; !wasPrefetched {
+				s.stats.Hits++
+				s.recordEvent(LoadEvent{
+					TensorName: t.Name,
+					Action:     "hit",
+					ByteSize:   e.tensor.ByteSize,
+				})
+			}
+		}
 	}
 
 	return result, nil
+}
+
+// discardPrefetch waits for and discards an in-flight prefetch that is no
+// longer needed (e.g., the caller jumped to a different layer).
+// Must be called with s.mu held.
+func (s *Streamer) discardPrefetch() {
+	if s.prefetch == nil {
+		return
+	}
+	pf := s.prefetch
+	s.prefetch = nil
+
+	// Must wait for the DMA to finish before we can free the buffers
+	s.loader.WaitComplete()
+
+	for _, b := range pf.buffers {
+		s.loader.DestroyGPUBuffer(b)
+	}
+	s.vramUsed -= pf.bytes
 }
 
 // IsResident returns whether a tensor is currently in GPU VRAM.

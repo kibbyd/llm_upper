@@ -44,6 +44,9 @@ var (
 	procCloseFile        *syscall.Proc
 	procEnqueueRead      *syscall.Proc
 	procSubmitAndWait    *syscall.Proc
+	procSubmit           *syscall.Proc
+	procIsComplete       *syscall.Proc
+	procWaitComplete     *syscall.Proc
 	dllLoaded            bool
 	dllLoadAttempted     bool
 )
@@ -97,6 +100,9 @@ func loadDLL() error {
 		{"ds_loader_close_file", &procCloseFile},
 		{"ds_loader_enqueue_read", &procEnqueueRead},
 		{"ds_loader_submit_and_wait", &procSubmitAndWait},
+		{"ds_loader_submit", &procSubmit},
+		{"ds_loader_is_complete", &procIsComplete},
+		{"ds_loader_wait_complete", &procWaitComplete},
 	}
 
 	for _, p := range procs {
@@ -417,6 +423,46 @@ func (l *Loader) SubmitAndWait() error {
 	ret, _, _ := procSubmitAndWait.Call(l.handle)
 	if int32(ret) != 0 {
 		return fmt.Errorf("submit and wait failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// --- Async submit for prefetching ---
+
+// Submit submits all enqueued requests WITHOUT waiting. Returns immediately.
+// The DMA transfer runs in the background on the GPU/NVMe hardware.
+// Call WaitComplete() or IsComplete() to check/wait for completion.
+func (l *Loader) Submit() error {
+	if l.closed {
+		return errors.New("loader is closed")
+	}
+
+	ret, _, _ := procSubmit.Call(l.handle)
+	if int32(ret) != 0 {
+		return fmt.Errorf("async submit failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// IsComplete returns true if the last Submit() has completed (non-blocking).
+// Returns true if there is no pending async work.
+func (l *Loader) IsComplete() bool {
+	if l.closed {
+		return true
+	}
+	ret, _, _ := procIsComplete.Call(l.handle)
+	return ret == 1
+}
+
+// WaitComplete blocks until the last Submit() completes.
+func (l *Loader) WaitComplete() error {
+	if l.closed {
+		return errors.New("loader is closed")
+	}
+
+	ret, _, _ := procWaitComplete.Call(l.handle)
+	if int32(ret) != 0 {
+		return fmt.Errorf("wait complete failed: HRESULT=0x%08X", uint32(GetLastHResult()))
 	}
 	return nil
 }

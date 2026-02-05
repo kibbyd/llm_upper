@@ -119,7 +119,7 @@ Instead of loading entire tensors at once, load them in small contiguous tiles (
 
 **What's done:** GGUF parser extracts tensor file offsets and sizes; LRU tensor residency manager loads/evicts whole tensors on demand; standalone demo proves layer-by-layer streaming works with real model files; chunked reads for >32MB tensors; file handle caching; request batching for multi-tensor loads.
 
-**What remains:** Sub-tensor tiling for fine-grained residency; prefetching.
+**What remains:** Sub-tensor tiling for fine-grained residency.
 
 ### Problem 5: Aggressive Quantization — STATUS: PARTIALLY DONE
 Reduce weight precision to shrink bandwidth requirements. Ollama already supports Q4 and Q8 quantization through GGML. Further compression (for example, 2-bit or 3-bit) could reduce the data that needs to be streamed by an additional 2-4x.
@@ -333,7 +333,7 @@ Our DLL does NOT statically link to `dstorage.lib`. Instead, it uses `LoadLibrar
 
 ## 6. THE NATIVE C API
 
-These are the 14 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
+These are the 17 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
 
 ### `int ds_loader_available()`
 Checks if DirectStorage is usable on this system. Internally:
@@ -497,6 +497,11 @@ func (l *Loader) OpenFile(filePath string) error
 func (l *Loader) CloseFile()
 func (l *Loader) EnqueueRead(fileOffset uint64, size uint64, gpuBuffer *GPUBuffer, bufferOffset uint64) error
 func (l *Loader) SubmitAndWait() error
+
+// Async submit API (for prefetching — submit DMA without blocking)
+func (l *Loader) Submit() error        // submit, return immediately
+func (l *Loader) IsComplete() bool     // non-blocking poll
+func (l *Loader) WaitComplete() error  // blocking wait
 ```
 
 ### DLL Search Path
@@ -506,7 +511,7 @@ When the Go code loads `dstorage_loader.dll`, it searches these locations in ord
 2. Next to the Go source file (using `runtime.Caller(0)`)
 3. Current working directory: `dstorage_loader.dll`
 
-The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 14 proc addresses are resolved at load time.
+The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 17 proc addresses are resolved at load time.
 
 ---
 
@@ -805,6 +810,16 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Second pass: 336/336 cache hits, 0ms
     - Tight budget (200MB, 10 layers): 108 evictions, correct LRU behavior, all tensors loaded successfully
 
+14. **Async prefetching** — Added 3 new C++ exports (`ds_loader_submit`, `ds_loader_is_complete`, `ds_loader_wait_complete`) with a persistent D3D12 fence+event for async DMA. Go bindings (`Submit`, `IsComplete`, `WaitComplete`). Streamer gains `PrefetchEnabled` flag and `prefetchState` — after loading layer N, it automatically enqueues layer N+1's reads via async submit, so the DMA runs in the background during compute. Results (with 100ms simulated compute per layer):
+    - **I/O wait reduced 73%**: 5.43s → **1.46s** (most I/O hidden behind compute)
+    - **Total time reduced 48%**: 8.25s → **4.27s** (I/O + compute)
+    - **Per-layer I/O wait**: ~194ms → **~45ms** average (DMA mostly completes during prior layer's compute)
+    - **blk.27**: 125ms → **0.0ms** (fully prefetched — DMA completed entirely during blk.26 compute)
+    - **Effective throughput**: 861 MB/s → **3,208 MB/s** (3.7x improvement)
+    - 27 prefetch events fired across 28 layers
+    - Data verified byte-perfect via GPU readback
+    - DLL now exports 17 functions total
+
 ---
 
 ## 14. WHAT WAS NOT DONE YET
@@ -823,7 +838,7 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 7. **GPU decompression** — DirectStorage supports GDeflate decompression on the GPU during transfer. Not implemented.
 
-8. **Prefetching** — The streamer loads tensors reactively (on demand). It could predict which tensors will be needed next (e.g., the next layer's tensors) and prefetch them during computation.
+8. ~~**Prefetching**~~ — **DONE.** `PrefetchEnabled=true` on the streamer auto-prefetches next layer during compute. I/O wait reduced 73%.
 
 9. **Streamer tests** — No unit tests for the `streamer/` package yet. The demo validates behavior but formal tests are needed.
 
@@ -841,7 +856,11 @@ Implemented `ds_loader_read_chunked()`. Full model loads in 5.6 seconds. See Sec
 
 Implemented 4 new C++ exports + Go bindings + streamer integration. Full model loads 14.5% faster (4.86s at 962 MB/s vs 5.6s at 840 MB/s). See Section 13, item 13.
 
-### Priority 1 (new): Prefetching
+### ~~Priority 1 (new): Prefetching~~ — DONE
+
+Implemented async submit/poll/wait + automatic next-layer prefetching in the streamer. I/O wait reduced 73%, total time reduced 48% with 100ms simulated compute. See Section 13, item 14.
+
+### Priority 1 (new): D3D12-CUDA Interop
 
 While one layer is being "processed" (simulated compute), prefetch the next layer's tensors in the background. This overlaps SSD I/O with computation and hides latency.
 
@@ -868,4 +887,5 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Initial document covering Problem 1 (DirectStorage SSD→GPU streaming) — SOLVED
 - 2026-02-05: Added GGUF parser, tensor streamer with LRU eviction, and standalone demo (Problem 4 partially done)
 - 2026-02-05: Implemented chunked reads — no more 32MB limit. Full 4.36GB model loads in 5.6s at 840 MB/s
-- 2026-02-05: Implemented file handle caching + request batching — 4 new C++ exports, Go bindings, streamer batched path. Full model loads in 4.86s at 962 MB/s (14.5% improvement). DLL now exports 14 functions.
+- 2026-02-05: Implemented file handle caching + request batching — 4 new C++ exports, Go bindings, streamer batched path. Full model loads in 4.86s at 962 MB/s (14.5% improvement).
+- 2026-02-05: Implemented async prefetching — 3 new C++ exports (async submit/poll/wait), Go bindings, streamer auto-prefetch of next layer. I/O wait reduced 73% (5.43s→1.46s), total time reduced 48% (8.25s→4.27s) with 100ms simulated compute. DLL now exports 17 functions.

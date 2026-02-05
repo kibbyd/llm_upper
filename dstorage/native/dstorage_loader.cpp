@@ -102,6 +102,12 @@ struct DSLoader {
     // Cached file handle for batched operations
     ComPtr<IDStorageFile> cachedFile;
     std::wstring cachedFilePath;
+
+    // Persistent fence for async submit/wait (prefetching)
+    ComPtr<ID3D12Fence> asyncFence;
+    HANDLE asyncEvent;
+    UINT64 asyncFenceValue;   // increments on each submit
+    bool asyncPending;         // true if a submit is in-flight
 };
 
 static HRESULT g_lastHR = S_OK;
@@ -180,11 +186,30 @@ DSLoaderHandle ds_loader_create() {
         return NULL;
     }
 
+    // Create persistent fence + event for async submit/prefetching
+    hr = loader->device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&loader->asyncFence));
+    if (FAILED(hr)) {
+        g_lastHR = hr;
+        delete loader;
+        return NULL;
+    }
+    loader->asyncEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!loader->asyncEvent) {
+        g_lastHR = HRESULT_FROM_WIN32(GetLastError());
+        delete loader;
+        return NULL;
+    }
+    loader->asyncFenceValue = 0;
+    loader->asyncPending = false;
+
     return loader;
 }
 
 void ds_loader_destroy(DSLoaderHandle loader) {
-    if (loader) delete loader;
+    if (loader) {
+        if (loader->asyncEvent) CloseHandle(loader->asyncEvent);
+        delete loader;
+    }
 }
 
 // --- GPU buffer management ---
@@ -424,6 +449,61 @@ int ds_loader_submit_and_wait(DSLoaderHandle loader) {
     return 0;
 }
 
+// --- Async submit for prefetching ---
+
+int ds_loader_submit(DSLoaderHandle loader) {
+    if (!loader) return -1;
+
+    // If a previous async submit is still pending, wait for it first
+    if (loader->asyncPending) {
+        WaitForSingleObject(loader->asyncEvent, INFINITE);
+        DSTORAGE_ERROR_RECORD errorRecord = {};
+        loader->queue->RetrieveErrorRecord(&errorRecord);
+        if (FAILED(errorRecord.FirstFailure.HResult)) {
+            g_lastHR = errorRecord.FirstFailure.HResult;
+            loader->asyncPending = false;
+            return -1;
+        }
+        loader->asyncPending = false;
+    }
+
+    // Increment fence value, enqueue signal, submit — return immediately
+    loader->asyncFenceValue++;
+    HRESULT hr = loader->asyncFence->SetEventOnCompletion(loader->asyncFenceValue, loader->asyncEvent);
+    if (FAILED(hr)) { g_lastHR = hr; return -1; }
+
+    loader->queue->EnqueueSignal(loader->asyncFence.Get(), loader->asyncFenceValue);
+    loader->queue->Submit();
+    loader->asyncPending = true;
+
+    return 0;
+}
+
+int ds_loader_is_complete(DSLoaderHandle loader) {
+    if (!loader) return 1;
+    if (!loader->asyncPending) return 1;
+
+    UINT64 completed = loader->asyncFence->GetCompletedValue();
+    return (completed >= loader->asyncFenceValue) ? 1 : 0;
+}
+
+int ds_loader_wait_complete(DSLoaderHandle loader) {
+    if (!loader) return -1;
+    if (!loader->asyncPending) return 0;
+
+    WaitForSingleObject(loader->asyncEvent, INFINITE);
+    loader->asyncPending = false;
+
+    // Check for errors
+    DSTORAGE_ERROR_RECORD errorRecord = {};
+    loader->queue->RetrieveErrorRecord(&errorRecord);
+    if (FAILED(errorRecord.FirstFailure.HResult)) {
+        g_lastHR = errorRecord.FirstFailure.HResult;
+        return -1;
+    }
+    return 0;
+}
+
 // --- GPU readback ---
 
 int ds_loader_gpu_readback(
@@ -535,6 +615,9 @@ void ds_loader_close_file(DSLoaderHandle loader) {}
 int ds_loader_enqueue_read(DSLoaderHandle loader, uint64_t file_offset,
                             uint64_t size, void* gpu_buffer, uint64_t buffer_offset) { return -1; }
 int ds_loader_submit_and_wait(DSLoaderHandle loader) { return -1; }
+int ds_loader_submit(DSLoaderHandle loader) { return -1; }
+int ds_loader_is_complete(DSLoaderHandle loader) { return 1; }
+int ds_loader_wait_complete(DSLoaderHandle loader) { return -1; }
 int ds_loader_gpu_readback(DSLoaderHandle loader, void* gpu_buffer,
                             uint64_t size, void* dest_memory) { return -1; }
 

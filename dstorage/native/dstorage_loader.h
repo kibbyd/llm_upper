@@ -95,6 +95,23 @@ DS_API int ds_loader_enqueue_read(
 // Returns 0 on success, -1 on failure.
 DS_API int ds_loader_submit_and_wait(DSLoaderHandle loader);
 
+// --- Async submit for prefetching ---
+
+// Submit all enqueued requests WITHOUT waiting. Returns immediately.
+// The DMA transfer runs in the background. Call ds_loader_wait_complete()
+// or ds_loader_is_complete() to check/wait for completion.
+// If a previous async submit is still pending, waits for it first.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_submit(DSLoaderHandle loader);
+
+// Non-blocking check: returns 1 if the last ds_loader_submit() has completed
+// (or if there is no pending work), 0 if still in-flight.
+DS_API int ds_loader_is_complete(DSLoaderHandle loader);
+
+// Block until the last ds_loader_submit() completes.
+// Returns 0 on success, -1 on failure (DirectStorage error in the batch).
+DS_API int ds_loader_wait_complete(DSLoaderHandle loader);
+
 // --- GPU readback (for verification/testing) ---
 // Copy data from GPU buffer back to CPU memory.
 // Uses a D3D12 readback heap + command list internally.
