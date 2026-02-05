@@ -61,6 +61,15 @@ var (
 	procCudaAlloc          *syscall.Proc
 	procCudaFree           *syscall.Proc
 	procCudaDtoH           *syscall.Proc
+	// VMM (Virtual Memory Management) procs
+	procVMMAvailable       *syscall.Proc
+	procVMMGetGranularity  *syscall.Proc
+	procVMMReserve         *syscall.Proc
+	procVMMFree            *syscall.Proc
+	procVMMCreatePhysical  *syscall.Proc
+	procVMMReleasePhysical *syscall.Proc
+	procVMMMap             *syscall.Proc
+	procVMMUnmap           *syscall.Proc
 	dllLoaded              bool
 	dllLoadAttempted       bool
 )
@@ -129,6 +138,15 @@ func loadDLL() error {
 		{"ds_loader_cuda_alloc", &procCudaAlloc},
 		{"ds_loader_cuda_free", &procCudaFree},
 		{"ds_loader_cuda_dtoh", &procCudaDtoH},
+		// VMM functions
+		{"ds_loader_vmm_available", &procVMMAvailable},
+		{"ds_loader_vmm_get_granularity", &procVMMGetGranularity},
+		{"ds_loader_vmm_reserve", &procVMMReserve},
+		{"ds_loader_vmm_free", &procVMMFree},
+		{"ds_loader_vmm_create_physical", &procVMMCreatePhysical},
+		{"ds_loader_vmm_release_physical", &procVMMReleasePhysical},
+		{"ds_loader_vmm_map", &procVMMMap},
+		{"ds_loader_vmm_unmap", &procVMMUnmap},
 	}
 
 	for _, p := range procs {
@@ -707,6 +725,111 @@ func CudaDtoH(srcCudaPtr uint64, dest []byte) error {
 	)
 	if int32(ret) != 0 {
 		return fmt.Errorf("CUDA DtoH failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// ============================================================
+// CUDA Virtual Memory Management (VMM) for MoE expert streaming
+// ============================================================
+
+// VMMAvailable checks if CUDA Virtual Memory Management is available.
+// VMM requires CUDA 10.2+ (driver 440.33+).
+func VMMAvailable() bool {
+	if err := loadDLL(); err != nil {
+		return false
+	}
+	ret, _, _ := procVMMAvailable.Call()
+	return ret == 1
+}
+
+// VMMGetGranularity returns the minimum allocation/mapping granularity.
+// All reserve/map sizes must be multiples of this value (typically 2 MB).
+// Returns 0 if VMM is not available.
+func VMMGetGranularity() uint64 {
+	if err := loadDLL(); err != nil {
+		return 0
+	}
+	ret, _, _ := procVMMGetGranularity.Call()
+	return uint64(ret)
+}
+
+// VMMReserve reserves virtual address space (no physical backing yet).
+// size and alignment must be multiples of VMMGetGranularity().
+// Returns 0 on failure.
+func VMMReserve(size, alignment uint64) uint64 {
+	if err := loadDLL(); err != nil {
+		return 0
+	}
+	ret, _, _ := procVMMReserve.Call(uintptr(size), uintptr(alignment))
+	return uint64(ret)
+}
+
+// VMMFree frees reserved virtual address space.
+// The range must be fully unmapped before calling this.
+func VMMFree(vaPtr, size uint64) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	ret, _, _ := procVMMFree.Call(uintptr(vaPtr), uintptr(size))
+	if int32(ret) != 0 {
+		return fmt.Errorf("VMM free failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// VMMCreatePhysical creates a physical memory allocation.
+// size must be a multiple of VMMGetGranularity().
+// Returns an opaque handle to the physical memory, or 0 on failure.
+func VMMCreatePhysical(size uint64) uint64 {
+	if err := loadDLL(); err != nil {
+		return 0
+	}
+	ret, _, _ := procVMMCreatePhysical.Call(uintptr(size))
+	return uint64(ret)
+}
+
+// VMMReleasePhysical releases a physical memory allocation.
+// The allocation must be unmapped from all VA ranges first.
+func VMMReleasePhysical(physHandle uint64) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	ret, _, _ := procVMMReleasePhysical.Call(uintptr(physHandle))
+	if int32(ret) != 0 {
+		return fmt.Errorf("VMM release physical failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// VMMMap maps physical memory to a virtual address range.
+// vaPtr must be within a reserved range, size <= physical allocation size.
+// offset is the offset within the physical allocation to map from.
+func VMMMap(vaPtr, size, physHandle, offset uint64) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	ret, _, _ := procVMMMap.Call(
+		uintptr(vaPtr),
+		uintptr(size),
+		uintptr(physHandle),
+		uintptr(offset),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("VMM map failed: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// VMMUnmap unmaps physical memory from a virtual address range.
+// The physical memory is NOT freed — it can be remapped elsewhere.
+func VMMUnmap(vaPtr, size uint64) error {
+	if err := loadDLL(); err != nil {
+		return err
+	}
+	ret, _, _ := procVMMUnmap.Call(uintptr(vaPtr), uintptr(size))
+	if int32(ret) != 0 {
+		return fmt.Errorf("VMM unmap failed: HRESULT=0x%08X", uint32(GetLastHResult()))
 	}
 	return nil
 }

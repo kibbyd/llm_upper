@@ -83,6 +83,64 @@ typedef CUresult (*PFN_cuMemAlloc_v2)(CUdeviceptr*, size_t);
 typedef CUresult (*PFN_cuMemFree_v2)(CUdeviceptr);
 typedef CUresult (*PFN_cuDeviceGetLuid)(char* luid, unsigned int* deviceNodeMask, CUdevice dev);
 
+// ============================================================
+// CUDA Virtual Memory Management (VMM) API types
+// For expert streaming: overcommit virtual address space, 
+// back with physical memory on demand.
+// Requires CUDA 10.2+ (driver 440.33+)
+// ============================================================
+
+typedef unsigned long long CUmemGenericAllocationHandle;
+
+// CUmemAllocationType
+#define CU_MEM_ALLOCATION_TYPE_PINNED 1
+
+// CUmemLocationType
+#define CU_MEM_LOCATION_TYPE_DEVICE 1
+
+// CUmemAccessFlags
+#define CU_MEM_ACCESS_FLAGS_PROT_READWRITE 3
+
+// CUmemAllocationGranularity_flags
+#define CU_MEM_ALLOC_GRANULARITY_MINIMUM 0
+#define CU_MEM_ALLOC_GRANULARITY_RECOMMENDED 1
+
+// CUmemAllocationHandleType
+#define CU_MEM_HANDLE_TYPE_NONE 0
+
+struct CUmemLocation {
+    int type;       // CUmemLocationType
+    int id;         // device ordinal
+};
+
+struct CUmemAllocationProp {
+    int type;                           // CUmemAllocationType
+    int requestedHandleTypes;           // CUmemAllocationHandleType
+    CUmemLocation location;
+    void* win32HandleMetaData;
+    struct {
+        unsigned char compressionType;
+        unsigned char gpuDirectRDMACapable;
+        unsigned short usage;
+        unsigned char reserved[4];
+    } allocFlags;
+};
+
+struct CUmemAccessDesc {
+    CUmemLocation location;
+    int flags;                          // CUmemAccessFlags
+};
+
+// VMM function pointer types
+typedef CUresult (*PFN_cuMemAddressReserve)(CUdeviceptr* ptr, size_t size, size_t alignment, CUdeviceptr addr, unsigned long long flags);
+typedef CUresult (*PFN_cuMemAddressFree)(CUdeviceptr ptr, size_t size);
+typedef CUresult (*PFN_cuMemCreate)(CUmemGenericAllocationHandle* handle, size_t size, const CUmemAllocationProp* prop, unsigned long long flags);
+typedef CUresult (*PFN_cuMemRelease)(CUmemGenericAllocationHandle handle);
+typedef CUresult (*PFN_cuMemMap)(CUdeviceptr ptr, size_t size, size_t offset, CUmemGenericAllocationHandle handle, unsigned long long flags);
+typedef CUresult (*PFN_cuMemUnmap)(CUdeviceptr ptr, size_t size);
+typedef CUresult (*PFN_cuMemSetAccess)(CUdeviceptr ptr, size_t size, const CUmemAccessDesc* desc, size_t count);
+typedef CUresult (*PFN_cuMemGetAllocationGranularity)(size_t* granularity, const CUmemAllocationProp* prop, int option);
+
 static HMODULE g_nvcudaModule = nullptr;
 static PFN_cuInit                            g_cuInit = nullptr;
 static PFN_cuDeviceGet                       g_cuDeviceGet = nullptr;
@@ -96,6 +154,17 @@ static PFN_cuMemcpyDtoD_v2                   g_cuMemcpyDtoD = nullptr;
 static PFN_cuMemAlloc_v2                     g_cuMemAlloc = nullptr;
 static PFN_cuMemFree_v2                      g_cuMemFree = nullptr;
 static PFN_cuDeviceGetLuid                   g_cuDeviceGetLuid = nullptr;
+
+// VMM function pointers
+static PFN_cuMemAddressReserve               g_cuMemAddressReserve = nullptr;
+static PFN_cuMemAddressFree                  g_cuMemAddressFree = nullptr;
+static PFN_cuMemCreate                       g_cuMemCreate = nullptr;
+static PFN_cuMemRelease                      g_cuMemRelease = nullptr;
+static PFN_cuMemMap                          g_cuMemMap = nullptr;
+static PFN_cuMemUnmap                        g_cuMemUnmap = nullptr;
+static PFN_cuMemSetAccess                    g_cuMemSetAccess = nullptr;
+static PFN_cuMemGetAllocationGranularity    g_cuMemGetAllocationGranularity = nullptr;
+static bool g_vmmAvailable = false;
 
 static bool g_cudaInitialized = false;
 static bool g_cudaInitAttempted = false;
@@ -178,6 +247,22 @@ static bool EnsureCudaLoaded() {
         !g_cuMemFree || !g_cuDeviceGetLuid) {
         return false;
     }
+
+    // Load VMM function pointers (optional - CUDA 10.2+)
+    g_cuMemAddressReserve = (PFN_cuMemAddressReserve)GetProcAddress(g_nvcudaModule, "cuMemAddressReserve");
+    g_cuMemAddressFree = (PFN_cuMemAddressFree)GetProcAddress(g_nvcudaModule, "cuMemAddressFree");
+    g_cuMemCreate = (PFN_cuMemCreate)GetProcAddress(g_nvcudaModule, "cuMemCreate");
+    g_cuMemRelease = (PFN_cuMemRelease)GetProcAddress(g_nvcudaModule, "cuMemRelease");
+    g_cuMemMap = (PFN_cuMemMap)GetProcAddress(g_nvcudaModule, "cuMemMap");
+    g_cuMemUnmap = (PFN_cuMemUnmap)GetProcAddress(g_nvcudaModule, "cuMemUnmap");
+    g_cuMemSetAccess = (PFN_cuMemSetAccess)GetProcAddress(g_nvcudaModule, "cuMemSetAccess");
+    g_cuMemGetAllocationGranularity = (PFN_cuMemGetAllocationGranularity)GetProcAddress(g_nvcudaModule, "cuMemGetAllocationGranularity");
+
+    // VMM is available if ALL VMM functions loaded (requires CUDA 10.2+ / driver 440.33+)
+    g_vmmAvailable = g_cuMemAddressReserve && g_cuMemAddressFree &&
+                     g_cuMemCreate && g_cuMemRelease &&
+                     g_cuMemMap && g_cuMemUnmap &&
+                     g_cuMemSetAccess && g_cuMemGetAllocationGranularity;
 
     // Initialize CUDA and get a context on device 0
     CUresult cr = g_cuInit(0);
@@ -1363,6 +1448,127 @@ void ds_loader_cuda_destroy(CUDAInteropHandle interop) {
     delete interop;
 }
 
+// ============================================================
+// CUDA Virtual Memory Management (VMM) for MoE expert streaming
+// ============================================================
+
+int ds_loader_vmm_available() {
+    if (!EnsureCudaLoaded()) return 0;
+    return g_vmmAvailable ? 1 : 0;
+}
+
+uint64_t ds_loader_vmm_get_granularity() {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable) return 0;
+    
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = g_cudaDevice;
+    
+    size_t granularity = 0;
+    CUresult cr = g_cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return 0;
+    }
+    return (uint64_t)granularity;
+}
+
+uint64_t ds_loader_vmm_reserve(uint64_t size, uint64_t alignment) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable) return 0;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUdeviceptr ptr = 0;
+    CUresult cr = g_cuMemAddressReserve(&ptr, (size_t)size, (size_t)alignment, 0, 0);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return 0;
+    }
+    return (uint64_t)ptr;
+}
+
+int ds_loader_vmm_free(uint64_t va_ptr, uint64_t size) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable || va_ptr == 0) return -1;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUresult cr = g_cuMemAddressFree((CUdeviceptr)va_ptr, (size_t)size);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    return 0;
+}
+
+uint64_t ds_loader_vmm_create_physical(uint64_t size) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable) return 0;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = g_cudaDevice;
+    
+    CUmemGenericAllocationHandle handle = 0;
+    CUresult cr = g_cuMemCreate(&handle, (size_t)size, &prop, 0);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return 0;
+    }
+    return (uint64_t)handle;
+}
+
+int ds_loader_vmm_release_physical(uint64_t phys_handle) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable || phys_handle == 0) return -1;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUresult cr = g_cuMemRelease((CUmemGenericAllocationHandle)phys_handle);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    return 0;
+}
+
+int ds_loader_vmm_map(uint64_t va_ptr, uint64_t size, uint64_t phys_handle, uint64_t offset) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable || va_ptr == 0 || phys_handle == 0) return -1;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUresult cr = g_cuMemMap((CUdeviceptr)va_ptr, (size_t)size, (size_t)offset,
+                             (CUmemGenericAllocationHandle)phys_handle, 0);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    
+    // CRITICAL: Must set access permissions after mapping!
+    CUmemAccessDesc accessDesc = {};
+    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    accessDesc.location.id = g_cudaDevice;
+    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    
+    cr = g_cuMemSetAccess((CUdeviceptr)va_ptr, (size_t)size, &accessDesc, 1);
+    if (cr != CUDA_SUCCESS) {
+        // Unmap on failure
+        g_cuMemUnmap((CUdeviceptr)va_ptr, (size_t)size);
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    
+    return 0;
+}
+
+int ds_loader_vmm_unmap(uint64_t va_ptr, uint64_t size) {
+    if (!EnsureCudaLoaded() || !g_vmmAvailable || va_ptr == 0) return -1;
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    CUresult cr = g_cuMemUnmap((CUdeviceptr)va_ptr, (size_t)size);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    return 0;
+}
+
 } // extern "C"
 
 #else // !_WIN32
@@ -1410,6 +1616,16 @@ int ds_loader_stream_to_cuda_batch(DSLoaderHandle loader, const wchar_t* file_pa
 uint64_t ds_loader_cuda_alloc(uint64_t size) { return 0; }
 void ds_loader_cuda_free(uint64_t ptr) {}
 int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size) { return -1; }
+
+// VMM stubs
+int ds_loader_vmm_available() { return 0; }
+uint64_t ds_loader_vmm_get_granularity() { return 0; }
+uint64_t ds_loader_vmm_reserve(uint64_t size, uint64_t alignment) { return 0; }
+int ds_loader_vmm_free(uint64_t va_ptr, uint64_t size) { return -1; }
+uint64_t ds_loader_vmm_create_physical(uint64_t size) { return 0; }
+int ds_loader_vmm_release_physical(uint64_t phys_handle) { return -1; }
+int ds_loader_vmm_map(uint64_t va_ptr, uint64_t size, uint64_t phys_handle, uint64_t offset) { return -1; }
+int ds_loader_vmm_unmap(uint64_t va_ptr, uint64_t size) { return -1; }
 
 } // extern "C"
 

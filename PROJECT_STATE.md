@@ -1215,22 +1215,32 @@ Why codestral shows a bigger advantage than gpt-oss:20b despite similar size: co
 
 Batch StreamToCuda eliminated 337 file opens + 337 fence creates. Load time: 9.15s → 3.83s (2.4x). Now within 20% of stock Ollama reading from RAM cache. See Section 13, item 18.
 
-### Priority 1 (current): MoE Expert Streaming
+### ~~Priority 1: MoE Model Analysis~~ — DONE
 
-The real target use case. For MoE models (Mixtral, DeepSeek MoE), each token only activates 2-8 experts out of 64. Stream only active expert weights per token:
-- At 1 GB/s, loading 500 MB of expert weights = 0.5s per token (~2 tok/s)
-- With async prefetch (predict next-layer experts): could hide most latency
-- Requires: hook into gating/routing layer, identify active experts, stream before compute
-- **Prerequisite:** Download and test a MoE model (Mixtral 8x7B = 24 GiB, or DeepSeek V2 Lite)
+Downloaded qwen3:30b (18.6 GB) MoE model. Key findings:
+- **48 layers**, 128 experts per layer, **8 active per token (6.25%)**
+- Expert tensors: `ffn_gate_exps` [2048, 768, 128], `ffn_up_exps` [2048, 768, 128], `ffn_down_exps` [768, 2048, 128]
+- Expert FFN = **17.55 GB (94.6% of model)**. Non-expert (attention, norms) = 0.95 GB (5.1%)
+- Per-expert size ~3 MB × 8 active × 48 layers = **1.17 GB active weights per token**
+- Stock Ollama: 40% GPU / 60% CPU split, **17.0 tok/s** generation — faster than dense models!
 
-### Priority 2: CUDA Virtual Memory Management (VMM)
+### ~~Priority 2: CUDA Virtual Memory Management (VMM)~~ — DONE
 
-Use cuMemAddressReserve/cuMemCreate/cuMemMap to overcommit VRAM:
-- Allocate virtual address space for entire model (e.g., 24 GB virtual, 7 GB physical)
-- Map/unmap physical pages as layers are needed
-- Gives GGML valid CUDA pointers for all tensors → all ops route to GPU
-- No GGML modifications needed — transparent to the compute graph
-- This is the key enabler for running any model on any VRAM size
+Implemented full CUDA VMM support:
+- 8 new DLL exports: `vmm_available`, `vmm_get_granularity`, `vmm_reserve`, `vmm_free`, `vmm_create_physical`, `vmm_release_physical`, `vmm_map`, `vmm_unmap`
+- Go bindings for all 8 functions
+- 3 new tests pass: VMM available, granularity = **2 MB**, reserve/map/unmap/remap cycle works
+- **This enables VRAM overcommit** — reserve 20 GB VA space, back with 6 GB physical, map/unmap experts on demand
+
+### Priority 1 (current): Expert Streaming Integration
+
+Now that VMM is working, next steps:
+1. **Expert allocator** — Track which VA ranges map to which physical allocations
+2. **DirectStorage + VMM integration** — Stream data into mapped VA regions
+3. **LRU eviction** — When physical pool full, unmap oldest experts
+4. **Ollama hook** — Intercept expert selection (routing layer output) to trigger streaming
+
+**Target:** All 48 layers on GPU, only active experts backed by physical memory. Should improve from 17.0 tok/s (40% GPU) toward 25+ tok/s (100% GPU).
 
 ### Priority 3: Problems 2, 3
 
@@ -1263,3 +1273,5 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Batch StreamToCuda optimization — ds_loader_stream_to_cuda_batch() opens file once, reuses single fence+event. Load time: 9.15s → 3.83s (2.4x faster). Now within 20% of stock Ollama. DLL exports 28 functions. All 24 tests pass.
 - 2026-02-05: Tested gpt-oss:20b (12.9 GiB) — 15/25 layers on GPU, 285 tensors (6.8 GiB) streamed via DirectStorage. Inference: 12.7 tok/s. Discovered dynamic per-token streaming is NOT viable for dense models (0.19 tok/s vs 13 tok/s CPU). Only viable for MoE expert streaming.
 - 2026-02-05: Tested codestral (12.6 GiB) — **4x faster model loading** (5.4s vs 22.2s stock). This confirmed the scaling insight: DirectStorage advantage GROWS with model size because OS cache becomes less effective while DirectStorage throughput stays constant. Inference speed identical (3.9 vs 4.0 tok/s) since both use same GPU/CPU layer split.
+- 2026-02-05: Downloaded and analyzed qwen3:30b MoE model (18.6 GB). Key findings: 48 layers, 128 experts per layer, 8 active per token (6.25%), expert tensors are 17.55 GB (94.6% of model!). Per-expert size ~3 MB. 8 active experts × 48 layers = 1.17 GB of expert weights per token. Stock Ollama runs at 17.0 tok/s with 40% GPU / 60% CPU split.
+- 2026-02-05: Implemented CUDA Virtual Memory Management (VMM) — 8 new DLL exports (vmm_available, vmm_get_granularity, vmm_reserve, vmm_free, vmm_create_physical, vmm_release_physical, vmm_map, vmm_unmap). Go bindings for all 8 functions. 3 new tests pass: VMM is available, granularity is 2 MB, reserve/map/unmap/remap cycle works. This enables overcommitting VRAM for MoE expert streaming. DLL now exports 36 functions. All 27 tests pass.

@@ -205,6 +205,59 @@ DS_API void ds_loader_cuda_free(uint64_t ptr);
 // src_cuda_ptr is a CUdeviceptr (from cuMemAlloc or ggml tensor->data).
 DS_API int ds_loader_cuda_dtoh(uint64_t src_cuda_ptr, void* dest, uint64_t size);
 
+// ============================================================
+// CUDA Virtual Memory Management (VMM) for MoE expert streaming
+// ============================================================
+// These functions enable overcommitting VRAM: reserve more virtual
+// address space than physical VRAM, then map/unmap physical memory
+// on demand. This allows streaming expert weights for MoE models.
+// Requires CUDA 10.2+ (driver 440.33+).
+
+// Check if CUDA VMM is available. Returns 1 if available, 0 if not.
+DS_API int ds_loader_vmm_available();
+
+// Get the allocation granularity (minimum mapping unit size).
+// All reserve/map sizes must be multiples of this value.
+// Typically 2 MB on modern NVIDIA GPUs. Returns 0 on failure.
+DS_API uint64_t ds_loader_vmm_get_granularity();
+
+// Reserve virtual address space (no physical backing yet).
+// size and alignment must be multiples of granularity.
+// Returns virtual address, or 0 on failure.
+DS_API uint64_t ds_loader_vmm_reserve(uint64_t size, uint64_t alignment);
+
+// Free reserved virtual address space.
+// The range must be fully unmapped before calling this.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_vmm_free(uint64_t va_ptr, uint64_t size);
+
+// Create a physical memory allocation (allocation handle).
+// size must be a multiple of granularity.
+// Returns opaque physical memory handle, or 0 on failure.
+DS_API uint64_t ds_loader_vmm_create_physical(uint64_t size);
+
+// Release a physical memory allocation.
+// The allocation must be unmapped from all VA ranges first.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_vmm_release_physical(uint64_t phys_handle);
+
+// Map physical memory to a virtual address range.
+// va_ptr must be within a reserved range, size must be <= phys allocation size.
+// offset is the offset within the physical allocation to map from.
+// Also sets read/write access permissions.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_vmm_map(
+    uint64_t va_ptr,
+    uint64_t size,
+    uint64_t phys_handle,
+    uint64_t offset
+);
+
+// Unmap physical memory from a virtual address range.
+// The physical memory is NOT freed — it can be remapped elsewhere.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_vmm_unmap(uint64_t va_ptr, uint64_t size);
+
 #ifdef __cplusplus
 }
 #endif
