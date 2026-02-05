@@ -75,7 +75,10 @@ This is not about making inference faster for models that already fit in memory.
 
 #### MinGW
 - **Installed at:** `C:\mingw64`
-- MinGW is NOT used for building this project. We use MSVC (cl.exe) for the C++ DLL and Go's standard toolchain for Go code. CGO is NOT used.
+- **GCC Version:** 15.2.0
+- MinGW IS used for building the full Ollama binary (CGO_ENABLED=1, the `llama` and `ggml` Go packages use CGO)
+- MinGW is NOT in PATH by default — must add `C:\mingw64\bin` to PATH before building Ollama
+- MSVC (cl.exe) is used for the `dstorage_loader.dll` C++ DLL (no CGO for our code)
 
 #### Tools NOT Available
 - `winget` is not in PATH
@@ -722,6 +725,28 @@ go run native/diagnose.go
 
 This is a standalone Go program (not part of the package due to `//go:build ignore`). It checks Windows version, D3D12, DirectStorage DLLs, and calls `ds_loader_available()`.
 
+### How to Build the Full Ollama Binary
+
+```bash
+# In Git Bash:
+cd /c/Users/danie/Documents/ollama
+export PATH="/c/mingw64/bin:$PATH"
+export CGO_ENABLED=1
+go build -v -o ollama_ds.exe .
+# Takes ~2 minutes. Produces 183 MB binary.
+```
+
+**Prerequisites:**
+- MinGW GCC at `C:\mingw64\bin` (NOT in PATH by default)
+- `CGO_ENABLED=1` required (llama/ggml packages use CGO)
+- No CMake or CUDA Toolkit needed — uses prebuilt GGML backend DLLs from installed Ollama
+- Harmless compiler warning: `llama-graph.cpp:473:9: warning: iteration 2147483645 invokes undefined behavior`
+
+**Creating the runtime lib junction (one-time):**
+```bash
+cmd //c "mkdir C:\\Users\\danie\\Documents\\ollama\\lib 2>nul & mklink /J C:\\Users\\danie\\Documents\\ollama\\lib\\ollama C:\\Users\\danie\\AppData\\Local\\Programs\\Ollama\\lib\\ollama"
+```
+
 ### How to Run Benchmarks
 
 ```powershell
@@ -863,12 +888,26 @@ These tests use `StreamToCuda()` — the complete path from SSD to a `cuMemAlloc
 | 1MB | 2.3ms | 429 MB/s |
 | 16MB | 7.3ms | 2,207 MB/s |
 
+### Test 4: End-to-End Ollama Model Loading (deepseek-r1:7b, OLLAMA_NEW_ENGINE=true)
+
+| Metric | Stock Ollama (std I/O) | DirectStorage (ollama_ds.exe) |
+|--------|----------------------|-------------------------------|
+| `load_duration` (API) | 3.17s | 9.15s |
+| Weight load time (commit→done) | ~1.1s | ~6.9s |
+| Throughput | ~3,800 MB/s (OS cache) | ~606 MB/s (SSD) |
+| GPU tensors loaded | 338 (standard path) | 338 (DirectStorage) |
+| Data transferred | 4,168.1 MB | 4,168.1 MB |
+| CPU RAM touched | Yes (full model copy) | No (zero-copy) |
+| OS page cache needed | Yes | No |
+
 ### Analysis
 
 1. Standard I/O appears faster because it reads from the OS page cache (RAM), not from SSD. DirectStorage always reads from SSD (bypasses the cache).
 2. DirectStorage has a fixed per-request overhead of approximately 1-5ms. This makes small reads (<256KB) very inefficient. Reads should be batched at 4MB+ for good throughput.
 3. At 16MB, DirectStorage SSD-to-GPU achieves ~2.2 GB/s, which approaches the raw NVMe sequential read speed of 1.6 GB/s. The apparent >1.6 GB/s throughput may be due to NVMe command queuing and SSD caching.
 4. The real advantage of DirectStorage is not speed over cached I/O. It is that the data goes directly to GPU VRAM without ever touching system RAM. For a 70B model where system RAM cannot hold the entire model, this is the only path that works.
+5. **End-to-end Ollama loading confirms:** DirectStorage is ~6x slower than cached I/O for warm models that fit in RAM. The `StreamToCuda` mutex serialization (single staging buffer) further limits throughput. Multiple staging buffers or pipelining DMA+copy could improve this.
+6. **Current implementation is serialized:** Each tensor goes through DMA→wait→cuMemcpyDtoD→next. No overlap between DMA and copy. The async prefetching infrastructure exists (in the streamer package) but is not used in the Ollama integration path.
 
 ---
 
@@ -894,12 +933,28 @@ Since the system has CUDA 13.0, Ollama uses `cuda_v13/ggml-cuda.dll`.
 ### Ollama Source Code
 - **Location:** `C:\Users\danie\Documents\ollama\`
 - **Go module:** `github.com/ollama/ollama` (go.mod at root, Go 1.24.1)
-- **Key source paths for future integration:**
-  - `ml/backend/ggml/ggml.go` — GGML backend, `Load()` function, `Backend` struct
-  - `ml/backend.go` — Backend interface definition
-  - `ml/device.go` — Device detection and selection
-  - `llm/server.go` — LLM server that loads and runs models
+- **Custom binary:** `C:\Users\danie\Documents\ollama\ollama_ds.exe` (183 MB, NOT in git)
+- **Runtime lib junction:** `C:\Users\danie\Documents\ollama\lib\ollama` → `C:\Users\danie\AppData\Local\Programs\Ollama\lib\ollama` (NOT in git, must recreate if deleted: `cmd /c "mklink /J C:\Users\danie\Documents\ollama\lib\ollama C:\Users\danie\AppData\Local\Programs\Ollama\lib\ollama"`)
+- **How to start:** `OLLAMA_DEBUG=1 OLLAMA_NEW_ENGINE=true C:/Users/danie/Documents/ollama/ollama_ds.exe serve`
+- **Key source paths:**
+  - `ml/backend/ggml/ggml.go` — GGML backend, `Load()` function with DirectStorage integration (MODIFIED)
+  - `ml/backend/ggml/dstorage/` — Our DirectStorage Go package + DLL
+  - `llm/server.go` — LLM server, `NewLlamaServer()`, engine selection logic
+  - `runner/runner.go` — Dispatches to `ollamarunner` (new) or `llamarunner` (old) based on `--ollama-engine`
+  - `runner/ollamarunner/runner.go` — New engine runner, calls `Backend.Load()` at line 1247
+  - `envconfig/config.go` — `OLLAMA_NEW_ENGINE` env var definition
   - `kvcache/causal.go` — KV cache implementation (relevant for Problem 3)
+
+#### Two Engine Code Paths (Critical for DirectStorage)
+```
+OLLAMA_NEW_ENGINE=true  → textProcessor != nil → StartRunner(ollamaEngine=true)
+                        → runner --ollama-engine → ollamarunner.Execute()
+                        → Server.loadModel() → Backend.Load() → OUR DIRECTSTORAGE CODE
+
+OLLAMA_NEW_ENGINE=false → textProcessor == nil  → StartRunner(ollamaEngine=false)
+                        → runner               → llamarunner.Execute()
+                        → C++ llama.cpp loads weights → NO GO CODE RUNS FOR WEIGHTS
+```
 
 ### Downloaded Models
 
@@ -1023,6 +1078,19 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Modified file: `ollama-patches/ggml.go` (copy of patched Ollama source)
     - Compiles cleanly: `go build github.com/ollama/ollama/ml/backend/ggml` succeeds
 
+18. **Full Ollama Binary Build + End-to-End Testing** — Built and tested complete Ollama binary with DirectStorage:
+    - **Build process:** `CGO_ENABLED=1` with MinGW GCC (`C:\mingw64\bin`), no CUDA SDK or CMake needed. Binary: 183 MB.
+    - **Build command:** `export PATH="/c/mingw64/bin:$PATH" && export CGO_ENABLED=1 && go build -v -o ollama_ds.exe .` from `C:\Users\danie\Documents\ollama`
+    - **Runtime lib junction:** `C:\Users\danie\Documents\ollama\lib\ollama` → `C:\Users\danie\AppData\Local\Programs\Ollama\lib\ollama`
+    - **Critical discovery:** `Backend.Load()` only executes via the NEW Ollama engine (`ollamarunner`). Must set `OLLAMA_NEW_ENGINE=true`. With the default (false), the old C++ `llamarunner` loads weights directly, bypassing our Go code entirely.
+    - **Code path:** `OLLAMA_NEW_ENGINE=true` → `NewLlamaServer()` creates `textProcessor` → `StartRunner()` passes `--ollama-engine` → subprocess calls `ollamarunner.Execute()` → `Server.loadModel()` → `Backend.Load()` → our DirectStorage code
+    - **Test results with deepseek-r1:7b:**
+      - 338/339 GPU tensors streamed via DirectStorage (1 tensor on CPU = token embeddings)
+      - 4,168.1 MB transferred SSD → GPU without touching CPU RAM
+      - Model produces correct output (math, reasoning, thinking all verified)
+      - Load time: ~6.9s for weight streaming (cold SSD) vs ~1.1s stock Ollama (OS cache)
+    - **Benchmark:** DirectStorage ~606 MB/s from SSD vs stock ~3,800 MB/s from OS cache. DirectStorage wins when model exceeds RAM.
+
 ---
 
 ## 14. WHAT WAS NOT DONE YET
@@ -1035,7 +1103,7 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 4. ~~**D3D12-CUDA interop**~~ — **DONE.** See Section 13, item 15. Full D3D12-CUDA memory sharing with LUID matching, shared heaps, and CUDA device pointers. Verified byte-perfect across 21 tests.
 
-5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-17. `Backend.Load()` in `ggml.go` now uses `StreamToCuda` for GPU-bound tensors. Compiles cleanly. Not yet tested end-to-end with a full Ollama build (requires CUDA SDK + CMake build toolchain).
+5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-18. `Backend.Load()` in `ggml.go` uses `StreamToCuda` for GPU-bound tensors. Full Ollama binary built and tested end-to-end with deepseek-r1:7b. 338 GPU tensors (4.1 GiB) streamed via DirectStorage. Correct inference verified.
 
 6. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
 
@@ -1065,15 +1133,37 @@ Implemented full D3D12-CUDA memory sharing with LUID matching, shared heaps, CUD
 
 Implemented `StreamToCuda` function and integrated into `Backend.Load()`. See Section 13, items 16-17.
 
-### Priority 1 (current): End-to-End Testing with Real Model
+### ~~Priority 1: End-to-End Testing with Real Model~~ — DONE
 
-Build Ollama with the DirectStorage integration and test with deepseek-r1:7b:
-1. Set up the full Ollama build toolchain (CMake, CUDA SDK, etc.)
-2. Build Ollama with the patched `ggml.go`
-3. Run `ollama run deepseek-r1:7b` and verify:
-   - Model loads correctly (check "DirectStorage: streamed N GPU tensors" log)
-   - Inference produces correct output
-   - Loading time is comparable or faster than baseline
+Built `ollama_ds.exe` (183 MB) with DirectStorage integration. Tested with deepseek-r1:7b. Results:
+- **DirectStorage activates successfully** with `OLLAMA_NEW_ENGINE=true`
+- **338 GPU tensors (4,168.1 MB)** streamed via SSD → GPU bypass
+- **Model produces correct output** — math, reasoning, thinking all verified
+- **Critical discovery:** `Backend.Load()` only runs via the NEW Ollama engine (`ollamarunner`). With `OLLAMA_NEW_ENGINE=false` (default), the old C++ `llamarunner` loads weights directly and our code never executes.
+
+**Benchmark: deepseek-r1:7b (4.1 GiB GPU weights, Q4_K_M)**
+
+| Metric | Stock Ollama (std I/O) | DirectStorage |
+|--------|----------------------|---------------|
+| load_duration (API) | 3.17s | 9.15s |
+| Weight load time (commit→done) | ~1.1s | ~6.9s |
+| Throughput | ~3,800 MB/s (OS cache) | ~606 MB/s (SSD) |
+| Data path | SSD → OS cache → CPU RAM → cudaMemcpy → GPU | SSD → DMA → D3D12 staging → cuMemcpyDtoD → GPU |
+| Touches CPU RAM? | Yes (full model copy) | No (zero-copy) |
+| OS page cache required? | Yes | No |
+
+**Analysis:** For a 7B model that fits in RAM, standard I/O from OS cache is ~6x faster because it reads from RAM (~3.8 GB/s) while DirectStorage reads from NVMe SSD (~600 MB/s). The real advantage of DirectStorage is when:
+1. Model exceeds system RAM (no OS cache available)
+2. Multiple large models swap without RAM thrashing
+3. 70B+ MoE models where only active expert weights need VRAM residency
+
+### Priority 1 (current): Optimize DirectStorage Loading Speed
+
+DirectStorage loading is currently ~6x slower than cached I/O for warm models. Potential optimizations:
+1. **Parallelize StreamToCuda calls** — Currently serialized via mutex (single staging buffer). Use multiple staging buffers or pipeline DMA + copy.
+2. **Batch multiple tensors into single DMA** — Group small tensors into larger contiguous reads
+3. **Implement mmap-like hybrid** — Use OS page cache when model fits in RAM, DirectStorage only for overflow
+4. **Pre-warm staging buffer** — Avoid auto-grow overhead on first large tensor
 
 ### Priority 2: Streamer CUDA Integration
 
@@ -1082,6 +1172,12 @@ Update the `streamer/` package to optionally create shared GPU buffers and expor
 ### Priority 3: Problems 2, 3
 
 Activation checkpointing and sliding window KV cache — required for production use with 70B models but can be tackled after the basic inference path works.
+
+### Priority 4: Test with Larger Models
+
+Test with models that stress system RAM:
+- codestral (12.6 GB) — likely pushes RAM limits
+- Download and test a 70B MoE model — the actual target use case
 
 ---
 
@@ -1098,3 +1194,5 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Implemented D3D12-CUDA interop — 6 new C++ exports (cuda_available, create_shared_gpu_buffer, export_to_cuda, cuda_get_device_ptr, cuda_memcpy_to_host, cuda_destroy). Dynamic nvcuda.dll loading, shared heap creation, cuImportExternalMemory with D3D12_HEAP type. Fixed GPU device mismatch (Bug 5) via LUID matching. DLL now exports 23 functions. All 21 tests pass including SSD→D3D12→CUDA→CPU byte-perfect roundtrip.
 - 2026-02-05: Implemented StreamToCuda — 4 new C++ exports (stream_to_cuda, cuda_alloc, cuda_free, cuda_dtoh). Reusable staging buffer with auto-grow. cuMemcpyDtoD for device-to-device. DLL now exports 27 functions. All 24 tests pass. Throughput: 2,207 MB/s at 16MB.
 - 2026-02-05: Ollama Backend.Load() integration — Modified ggml.go to import dstorage package, detect GPU tensors via ggml_backend_buffer_is_host(), call StreamToCuda for CUDA-bound tensors with fallback to standard I/O. Compiles cleanly. Patched file saved to ollama-patches/ggml.go.
+- 2026-02-05: Full Ollama binary built (183 MB). Discovered Backend.Load() only runs with OLLAMA_NEW_ENGINE=true (ollamarunner). Old engine (llamarunner) uses C++ weight loading, never calls our Go code.
+- 2026-02-05: End-to-end test SUCCESS with deepseek-r1:7b + OLLAMA_NEW_ENGINE=true. DirectStorage activated: 338 GPU tensors (4,168.1 MB) streamed via SSD→GPU bypass. Model produces correct output (math, reasoning, thinking verified). Benchmark: DirectStorage ~606 MB/s from SSD vs stock ~3,800 MB/s from OS cache.
