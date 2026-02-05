@@ -11,6 +11,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <string>
+#include <unordered_map>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -24,6 +25,78 @@ typedef HRESULT (WINAPI *PFN_DStorageGetFactory)(REFIID riid, void** ppv);
 static PFN_DStorageGetFactory g_DStorageGetFactory = nullptr;
 static HMODULE g_dstorageModule = nullptr;
 static HMODULE g_dstorageCoreModule = nullptr;
+
+// ============================================================
+// CUDA Driver API types and function pointers
+// Defined manually — no CUDA SDK/headers needed.
+// nvcuda.dll ships with every NVIDIA display driver.
+// ============================================================
+
+typedef int CUresult;
+typedef int CUdevice;
+typedef void* CUcontext;
+typedef unsigned long long CUdeviceptr;
+typedef void* CUexternalMemory;
+
+#define CUDA_SUCCESS 0
+#define CUDA_EXTERNAL_MEMORY_DEDICATED 0x1
+
+typedef enum {
+    CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP     = 4,
+    CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE = 5,
+} CUexternalMemoryHandleType;
+
+// Must match CUDA driver API struct layout exactly (x64, default packing)
+struct CUDA_EXTERNAL_MEMORY_HANDLE_DESC_v1 {
+    CUexternalMemoryHandleType type;    // 4 bytes + 4 padding (union aligned to 8)
+    union {
+        int fd;
+        struct {
+            void* handle;
+            const void* name;
+        } win32;
+        const void* nvSciBufObject;
+    } handle;                           // 16 bytes (two pointers)
+    unsigned long long size;            // 8 bytes
+    unsigned int flags;                 // 4 bytes
+    unsigned int reserved[16];          // 64 bytes
+};
+
+struct CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1 {
+    unsigned long long offset;          // 8 bytes
+    unsigned long long size;            // 8 bytes
+    unsigned int flags;                 // 4 bytes
+    unsigned int reserved[16];          // 64 bytes
+};
+
+// CUDA driver API function pointer types
+typedef CUresult (*PFN_cuInit)(unsigned int);
+typedef CUresult (*PFN_cuDeviceGet)(CUdevice*, int);
+typedef CUresult (*PFN_cuDevicePrimaryCtxRetain)(CUcontext*, CUdevice);
+typedef CUresult (*PFN_cuCtxSetCurrent)(CUcontext);
+typedef CUresult (*PFN_cuImportExternalMemory)(CUexternalMemory*, const CUDA_EXTERNAL_MEMORY_HANDLE_DESC_v1*);
+typedef CUresult (*PFN_cuExternalMemoryGetMappedBuffer)(CUdeviceptr*, CUexternalMemory, const CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1*);
+typedef CUresult (*PFN_cuDestroyExternalMemory)(CUexternalMemory);
+typedef CUresult (*PFN_cuMemcpyDtoH_v2)(void*, CUdeviceptr, size_t);
+typedef CUresult (*PFN_cuMemFree_v2)(CUdeviceptr);
+typedef CUresult (*PFN_cuDeviceGetLuid)(char* luid, unsigned int* deviceNodeMask, CUdevice dev);
+
+static HMODULE g_nvcudaModule = nullptr;
+static PFN_cuInit                            g_cuInit = nullptr;
+static PFN_cuDeviceGet                       g_cuDeviceGet = nullptr;
+static PFN_cuDevicePrimaryCtxRetain          g_cuDevicePrimaryCtxRetain = nullptr;
+static PFN_cuCtxSetCurrent                   g_cuCtxSetCurrent = nullptr;
+static PFN_cuImportExternalMemory            g_cuImportExternalMemory = nullptr;
+static PFN_cuExternalMemoryGetMappedBuffer   g_cuExternalMemoryGetMappedBuffer = nullptr;
+static PFN_cuDestroyExternalMemory           g_cuDestroyExternalMemory = nullptr;
+static PFN_cuMemcpyDtoH_v2                   g_cuMemcpyDtoH = nullptr;
+static PFN_cuMemFree_v2                      g_cuMemFree = nullptr;
+static PFN_cuDeviceGetLuid                   g_cuDeviceGetLuid = nullptr;
+
+static bool g_cudaInitialized = false;
+static bool g_cudaInitAttempted = false;
+static CUcontext g_cudaContext = nullptr;
+static CUdevice g_cudaDevice = 0;
 
 static bool EnsureDStorageLoaded() {
     if (g_DStorageGetFactory) return true;
@@ -67,6 +140,55 @@ static bool EnsureDStorageLoaded() {
     return g_DStorageGetFactory != nullptr;
 }
 
+// ============================================================
+// CUDA initialization (dynamic loading of nvcuda.dll)
+// ============================================================
+
+static bool EnsureCudaLoaded() {
+    if (g_cudaInitialized) return true;
+    if (g_cudaInitAttempted) return false;  // already tried, failed
+    g_cudaInitAttempted = true;
+
+    // nvcuda.dll is in System32 on any system with NVIDIA drivers
+    g_nvcudaModule = LoadLibraryW(L"nvcuda.dll");
+    if (!g_nvcudaModule) return false;
+
+    // Load all function pointers
+    g_cuInit = (PFN_cuInit)GetProcAddress(g_nvcudaModule, "cuInit");
+    g_cuDeviceGet = (PFN_cuDeviceGet)GetProcAddress(g_nvcudaModule, "cuDeviceGet");
+    g_cuDevicePrimaryCtxRetain = (PFN_cuDevicePrimaryCtxRetain)GetProcAddress(g_nvcudaModule, "cuDevicePrimaryCtxRetain");
+    g_cuCtxSetCurrent = (PFN_cuCtxSetCurrent)GetProcAddress(g_nvcudaModule, "cuCtxSetCurrent");
+    g_cuImportExternalMemory = (PFN_cuImportExternalMemory)GetProcAddress(g_nvcudaModule, "cuImportExternalMemory");
+    g_cuExternalMemoryGetMappedBuffer = (PFN_cuExternalMemoryGetMappedBuffer)GetProcAddress(g_nvcudaModule, "cuExternalMemoryGetMappedBuffer");
+    g_cuDestroyExternalMemory = (PFN_cuDestroyExternalMemory)GetProcAddress(g_nvcudaModule, "cuDestroyExternalMemory");
+    g_cuMemcpyDtoH = (PFN_cuMemcpyDtoH_v2)GetProcAddress(g_nvcudaModule, "cuMemcpyDtoH_v2");
+    g_cuMemFree = (PFN_cuMemFree_v2)GetProcAddress(g_nvcudaModule, "cuMemFree_v2");
+    g_cuDeviceGetLuid = (PFN_cuDeviceGetLuid)GetProcAddress(g_nvcudaModule, "cuDeviceGetLuid");
+
+    if (!g_cuInit || !g_cuDeviceGet || !g_cuDevicePrimaryCtxRetain ||
+        !g_cuCtxSetCurrent || !g_cuImportExternalMemory ||
+        !g_cuExternalMemoryGetMappedBuffer || !g_cuDestroyExternalMemory ||
+        !g_cuMemcpyDtoH || !g_cuMemFree || !g_cuDeviceGetLuid) {
+        return false;
+    }
+
+    // Initialize CUDA and get a context on device 0
+    CUresult cr = g_cuInit(0);
+    if (cr != CUDA_SUCCESS) return false;
+
+    cr = g_cuDeviceGet(&g_cudaDevice, 0);
+    if (cr != CUDA_SUCCESS) return false;
+
+    cr = g_cuDevicePrimaryCtxRetain(&g_cudaContext, g_cudaDevice);
+    if (cr != CUDA_SUCCESS) return false;
+
+    cr = g_cuCtxSetCurrent(g_cudaContext);
+    if (cr != CUDA_SUCCESS) return false;
+
+    g_cudaInitialized = true;
+    return true;
+}
+
 // Helper: submit queue, wait for fence, check errors
 static HRESULT SubmitAndWait(IDStorageQueue* queue, ID3D12Device* device) {
     ComPtr<ID3D12Fence> fence;
@@ -108,6 +230,22 @@ struct DSLoader {
     HANDLE asyncEvent;
     UINT64 asyncFenceValue;   // increments on each submit
     bool asyncPending;         // true if a submit is in-flight
+
+    // Track shared heaps for D3D12-CUDA interop:
+    // Maps ID3D12Resource* -> (heap, heapSize) for shared placed resources.
+    // The heap must live as long as the resource.
+    struct SharedHeapEntry {
+        ComPtr<ID3D12Heap> heap;
+        uint64_t heapSize;
+    };
+    std::unordered_map<ID3D12Resource*, SharedHeapEntry> sharedHeaps;
+};
+
+struct CUDAInterop {
+    CUexternalMemory extMem;   // CUDA external memory handle
+    CUdeviceptr devPtr;        // CUDA device pointer (accessible by CUDA/GGML)
+    HANDLE sharedHandle;       // NT handle from ID3D12Device::CreateSharedHandle
+    uint64_t size;             // buffer size in bytes
 };
 
 static HRESULT g_lastHR = S_OK;
@@ -144,7 +282,67 @@ DSLoaderHandle ds_loader_create() {
     DSLoader* loader = new (std::nothrow) DSLoader();
     if (!loader) return NULL;
 
-    HRESULT hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&loader->device));
+    // LUID matching: if CUDA is available, find the DXGI adapter that matches
+    // the CUDA device's LUID. This ensures D3D12 and CUDA use the same GPU,
+    // which is required for D3D12-CUDA interop (cuImportExternalMemory).
+    // On laptops with Intel iGPU + NVIDIA dGPU, D3D12CreateDevice(NULL, ...)
+    // may pick the Intel iGPU while CUDA device 0 is the NVIDIA GPU.
+    HRESULT hr = E_FAIL;
+    bool deviceCreated = false;
+
+    if (EnsureCudaLoaded() && g_cuDeviceGetLuid) {
+        // Get CUDA device's LUID
+        char cudaLuid[8] = {};
+        unsigned int cudaNodeMask = 0;
+        CUresult cr = g_cuDeviceGetLuid(cudaLuid, &cudaNodeMask, g_cudaDevice);
+
+        if (cr == CUDA_SUCCESS) {
+            // Create DXGI factory to enumerate adapters
+            typedef HRESULT (WINAPI *PFN_CreateDXGIFactory2)(UINT, REFIID, void**);
+            HMODULE dxgiMod = GetModuleHandleW(L"dxgi.dll");
+            if (!dxgiMod) dxgiMod = LoadLibraryW(L"dxgi.dll");
+
+            if (dxgiMod) {
+                PFN_CreateDXGIFactory2 pfnCreateFactory =
+                    (PFN_CreateDXGIFactory2)GetProcAddress(dxgiMod, "CreateDXGIFactory2");
+
+                if (pfnCreateFactory) {
+                    ComPtr<IDXGIFactory4> dxgiFactory;
+                    hr = pfnCreateFactory(0, IID_PPV_ARGS(&dxgiFactory));
+
+                    if (SUCCEEDED(hr)) {
+                        // Convert CUDA LUID bytes to LUID struct
+                        LUID adapterLuid;
+                        memcpy(&adapterLuid, cudaLuid, sizeof(LUID));
+
+                        // Find the adapter matching CUDA's LUID
+                        ComPtr<IDXGIAdapter> adapter;
+                        hr = dxgiFactory->EnumAdapterByLuid(adapterLuid, IID_PPV_ARGS(&adapter));
+
+                        if (SUCCEEDED(hr)) {
+                            // Create D3D12 device on the CUDA-matching adapter
+                            hr = D3D12CreateDevice(
+                                adapter.Get(),
+                                D3D_FEATURE_LEVEL_12_1,
+                                IID_PPV_ARGS(&loader->device));
+
+                            if (SUCCEEDED(hr)) {
+                                deviceCreated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: if LUID matching failed (no CUDA, or adapter not found),
+    // use the default adapter. D3D12-CUDA interop may not work, but
+    // DirectStorage SSD→GPU streaming will still function.
+    if (!deviceCreated) {
+        hr = D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, IID_PPV_ARGS(&loader->device));
+    }
+
     if (FAILED(hr)) {
         g_lastHR = hr;
         delete loader;
@@ -589,6 +787,270 @@ int ds_loader_gpu_readback(
     return 0;
 }
 
+// --- Diagnostic for shared heap support ---
+
+// Returns bitmask: bits 0-7 = ResourceHeapTier, bit 8 = heap(SHARED), bit 9 = heap(SHARED+DENY),
+// bit 10 = placed(no flags), bit 11 = placed(SIMULTANEOUS_ACCESS), bit 12 = committed(SHARED).
+// g_lastHR set to first failed HRESULT.
+int ds_loader_debug_shared(DSLoaderHandle loader) {
+    if (!loader) return -1;
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    loader->device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+
+    int result = (int)(options.ResourceHeapTier & 0xFF);
+
+    // Test 1: CreateHeap with SHARED only
+    D3D12_HEAP_DESC hd = {};
+    hd.SizeInBytes = 65536;
+    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hd.Properties.CreationNodeMask = 1;
+    hd.Properties.VisibleNodeMask = 1;
+    hd.Alignment = 65536;
+    hd.Flags = D3D12_HEAP_FLAG_SHARED;
+
+    ComPtr<ID3D12Heap> h1;
+    HRESULT hr = loader->device->CreateHeap(&hd, IID_PPV_ARGS(&h1));
+    if (SUCCEEDED(hr)) result |= (1 << 8);
+    else g_lastHR = hr;
+
+    // Test 2: CreateHeap with SHARED + buffer-only deny flags
+    hd.Flags = (D3D12_HEAP_FLAGS)(D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES);
+    ComPtr<ID3D12Heap> h2;
+    hr = loader->device->CreateHeap(&hd, IID_PPV_ARGS(&h2));
+    if (SUCCEEDED(hr)) result |= (1 << 9);
+
+    // Test 3 & 4: CreatePlacedResource on whichever heap worked
+    ID3D12Heap* heap = h1 ? h1.Get() : (h2 ? h2.Get() : nullptr);
+    if (heap) {
+        D3D12_RESOURCE_DESC rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = 65536;
+        rd.Height = 1;
+        rd.DepthOrArraySize = 1;
+        rd.MipLevels = 1;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.SampleDesc.Count = 1;
+
+        rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+        ComPtr<ID3D12Resource> r3;
+        hr = loader->device->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r3));
+        if (SUCCEEDED(hr)) result |= (1 << 10);
+        else if (!(result & 0xFF00)) g_lastHR = hr;
+
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+        ComPtr<ID3D12Resource> r4;
+        hr = loader->device->CreatePlacedResource(heap, 0, &rd, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r4));
+        if (SUCCEEDED(hr)) result |= (1 << 11);
+    }
+
+    // Test 5: CreateCommittedResource with SHARED
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    hp.CreationNodeMask = 1;
+    hp.VisibleNodeMask = 1;
+    D3D12_RESOURCE_DESC rd2 = {};
+    rd2.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    rd2.Width = 65536;
+    rd2.Height = 1;
+    rd2.DepthOrArraySize = 1;
+    rd2.MipLevels = 1;
+    rd2.Format = DXGI_FORMAT_UNKNOWN;
+    rd2.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    rd2.SampleDesc.Count = 1;
+    rd2.Flags = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+    ComPtr<ID3D12Resource> r5;
+    hr = loader->device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd2, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&r5));
+    if (SUCCEEDED(hr)) result |= (1 << 12);
+
+    return result;
+}
+
+// --- CUDA interop (D3D12 <-> CUDA shared memory) ---
+
+int ds_loader_cuda_available() {
+    return EnsureCudaLoaded() ? 1 : 0;
+}
+
+void* ds_loader_create_shared_gpu_buffer(DSLoaderHandle loader, uint64_t size) {
+    if (!loader || size == 0) return NULL;
+
+    // Align heap size up to 64KB (D3D12 resource placement alignment)
+    uint64_t heapSize = (size + 65535) & ~65535ULL;
+
+    // Step 1: Create a shared D3D12 heap
+    D3D12_HEAP_DESC heapDesc = {};
+    heapDesc.SizeInBytes = heapSize;
+    heapDesc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heapDesc.Properties.CreationNodeMask = 1;
+    heapDesc.Properties.VisibleNodeMask = 1;
+    heapDesc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT; // 64KB
+    heapDesc.Flags = D3D12_HEAP_FLAG_SHARED | D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES;
+
+    ComPtr<ID3D12Heap> heap;
+    HRESULT hr = loader->device->CreateHeap(&heapDesc, IID_PPV_ARGS(&heap));
+    if (FAILED(hr)) {
+        g_lastHR = hr;
+        return NULL;
+    }
+
+    // Step 2: Create a placed resource on the shared heap
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment = 0;
+    desc.Width = size;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ID3D12Resource* resource = nullptr;
+    hr = loader->device->CreatePlacedResource(
+        heap.Get(), 0, &desc,
+        D3D12_RESOURCE_STATE_COMMON,
+        nullptr,
+        IID_PPV_ARGS(&resource));
+
+    if (FAILED(hr)) {
+        g_lastHR = hr;
+        return NULL;
+    }
+
+    // Track the heap alongside the resource for CUDA export
+    loader->sharedHeaps[resource] = { heap, heapSize };
+
+    return resource;
+}
+
+CUDAInteropHandle ds_loader_export_to_cuda(DSLoaderHandle loader, void* shared_gpu_buffer, uint64_t size) {
+    if (!loader || !shared_gpu_buffer || size == 0) return NULL;
+    if (!EnsureCudaLoaded()) return NULL;
+
+    ID3D12Resource* resource = (ID3D12Resource*)shared_gpu_buffer;
+
+    // Look up the shared heap for this resource
+    auto it = loader->sharedHeaps.find(resource);
+    if (it == loader->sharedHeaps.end()) {
+        // Not a shared buffer — must use ds_loader_create_shared_gpu_buffer
+        g_lastHR = E_HANDLE;
+        return NULL;
+    }
+    ID3D12Heap* heap = it->second.heap.Get();
+    uint64_t heapSize = it->second.heapSize;
+
+    // Step 1: Create shared NT handle from the D3D12 HEAP
+    HANDLE sharedHandle = NULL;
+    HRESULT hr = loader->device->CreateSharedHandle(
+        heap,
+        nullptr,        // security attributes
+        GENERIC_ALL,    // access
+        nullptr,        // name
+        &sharedHandle);
+
+    if (FAILED(hr) || !sharedHandle) {
+        g_lastHR = hr ? hr : E_HANDLE;
+        return NULL;
+    }
+
+    // Step 2: Ensure CUDA context is current
+    CUresult cr = g_cuCtxSetCurrent(g_cudaContext);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCC000000 | (cr & 0xFFFF));  // CC = CUDA context error
+        CloseHandle(sharedHandle);
+        return NULL;
+    }
+
+    // Step 3: Import D3D12 HEAP into CUDA as external memory
+    //         (D3D12_HEAP type, NOT D3D12_RESOURCE — heap-based interop)
+    CUDA_EXTERNAL_MEMORY_HANDLE_DESC_v1 memDesc = {};
+    memDesc.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP;
+    memDesc.handle.win32.handle = sharedHandle;
+    memDesc.handle.win32.name = nullptr;
+    memDesc.size = heapSize;  // must match the actual heap size (64KB-aligned)
+    memDesc.flags = 0;        // NOT CUDA_EXTERNAL_MEMORY_DEDICATED for heaps
+
+    CUexternalMemory extMem = nullptr;
+    cr = g_cuImportExternalMemory(&extMem, &memDesc);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCA000000 | (cr & 0xFFFF));  // CA = CUDA import error
+        CloseHandle(sharedHandle);
+        return NULL;
+    }
+
+    // Step 4: Map a buffer from the imported heap memory to a CUDA device pointer
+    //         The placed resource starts at offset 0 and has 'size' bytes of data
+    CUDA_EXTERNAL_MEMORY_BUFFER_DESC_v1 bufDesc = {};
+    bufDesc.offset = 0;
+    bufDesc.size = size;      // original data size, not the aligned heap size
+    bufDesc.flags = 0;
+
+    CUdeviceptr devPtr = 0;
+    cr = g_cuExternalMemoryGetMappedBuffer(&devPtr, extMem, &bufDesc);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCB000000 | (cr & 0xFFFF));  // CB = CUDA map error
+        g_cuDestroyExternalMemory(extMem);
+        CloseHandle(sharedHandle);
+        return NULL;
+    }
+
+    // Step 5: Package into opaque interop handle
+    CUDAInterop* interop = new (std::nothrow) CUDAInterop();
+    if (!interop) {
+        g_cuMemFree(devPtr);
+        g_cuDestroyExternalMemory(extMem);
+        CloseHandle(sharedHandle);
+        return NULL;
+    }
+
+    interop->extMem = extMem;
+    interop->devPtr = devPtr;
+    interop->sharedHandle = sharedHandle;
+    interop->size = size;
+
+    return interop;
+}
+
+uint64_t ds_loader_cuda_get_device_ptr(CUDAInteropHandle interop) {
+    if (!interop) return 0;
+    return interop->devPtr;
+}
+
+int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, uint64_t size) {
+    if (!interop || !dest || size == 0) return -1;
+    if (!g_cudaInitialized) return -1;
+
+    CUresult cr = g_cuCtxSetCurrent(g_cudaContext);
+    if (cr != CUDA_SUCCESS) return -1;
+
+    cr = g_cuMemcpyDtoH(dest, interop->devPtr, (size_t)size);
+    if (cr != CUDA_SUCCESS) return -1;
+
+    return 0;
+}
+
+void ds_loader_cuda_destroy(CUDAInteropHandle interop) {
+    if (!interop) return;
+
+    if (g_cudaInitialized) {
+        g_cuCtxSetCurrent(g_cudaContext);
+        if (interop->devPtr) {
+            g_cuMemFree(interop->devPtr);
+        }
+        if (interop->extMem) {
+            g_cuDestroyExternalMemory(interop->extMem);
+        }
+    }
+    if (interop->sharedHandle) {
+        CloseHandle(interop->sharedHandle);
+    }
+
+    delete interop;
+}
+
 } // extern "C"
 
 #else // !_WIN32
@@ -620,6 +1082,14 @@ int ds_loader_is_complete(DSLoaderHandle loader) { return 1; }
 int ds_loader_wait_complete(DSLoaderHandle loader) { return -1; }
 int ds_loader_gpu_readback(DSLoaderHandle loader, void* gpu_buffer,
                             uint64_t size, void* dest_memory) { return -1; }
+int ds_loader_debug_shared(DSLoaderHandle loader) { return -1; }
+int ds_loader_cuda_available() { return 0; }
+void* ds_loader_create_shared_gpu_buffer(DSLoaderHandle loader, uint64_t size) { return NULL; }
+CUDAInteropHandle ds_loader_export_to_cuda(DSLoaderHandle loader,
+                                            void* shared_gpu_buffer, uint64_t size) { return NULL; }
+uint64_t ds_loader_cuda_get_device_ptr(CUDAInteropHandle interop) { return 0; }
+int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, uint64_t size) { return -1; }
+void ds_loader_cuda_destroy(CUDAInteropHandle interop) {}
 
 } // extern "C"
 

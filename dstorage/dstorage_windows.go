@@ -17,38 +17,47 @@ import (
 )
 
 var (
-	ErrNotAvailable    = errors.New("DirectStorage not available on this system")
-	ErrInitFailed      = errors.New("failed to initialize DirectStorage")
-	ErrLoadFailed      = errors.New("failed to load block")
-	ErrQueueFull       = errors.New("DirectStorage queue full")
-	ErrInvalidArgument = errors.New("invalid argument")
-	ErrDLLNotFound     = errors.New("dstorage_loader.dll not found")
-	ErrBufferFailed    = errors.New("failed to create GPU buffer")
-	ErrReadbackFailed  = errors.New("GPU readback failed")
+	ErrNotAvailable      = errors.New("DirectStorage not available on this system")
+	ErrInitFailed        = errors.New("failed to initialize DirectStorage")
+	ErrLoadFailed        = errors.New("failed to load block")
+	ErrQueueFull         = errors.New("DirectStorage queue full")
+	ErrInvalidArgument   = errors.New("invalid argument")
+	ErrDLLNotFound       = errors.New("dstorage_loader.dll not found")
+	ErrBufferFailed      = errors.New("failed to create GPU buffer")
+	ErrReadbackFailed    = errors.New("GPU readback failed")
+	ErrCudaNotAvailable  = errors.New("CUDA not available")
+	ErrCudaInteropFailed = errors.New("CUDA interop failed")
 )
 
 // DLL function pointers
 var (
-	dll                  *syscall.DLL
-	procAvailable        *syscall.Proc
-	procGetHResult       *syscall.Proc
-	procCreate           *syscall.Proc
-	procDestroy          *syscall.Proc
-	procCreateGPUBuffer  *syscall.Proc
-	procDestroyGPUBuffer *syscall.Proc
-	procRead             *syscall.Proc
-	procReadChunked      *syscall.Proc
-	procReadToMemory     *syscall.Proc
-	procGPUReadback      *syscall.Proc
-	procOpenFile         *syscall.Proc
-	procCloseFile        *syscall.Proc
-	procEnqueueRead      *syscall.Proc
-	procSubmitAndWait    *syscall.Proc
-	procSubmit           *syscall.Proc
-	procIsComplete       *syscall.Proc
-	procWaitComplete     *syscall.Proc
-	dllLoaded            bool
-	dllLoadAttempted     bool
+	dll                    *syscall.DLL
+	procAvailable          *syscall.Proc
+	procGetHResult         *syscall.Proc
+	procCreate             *syscall.Proc
+	procDestroy            *syscall.Proc
+	procCreateGPUBuffer    *syscall.Proc
+	procDestroyGPUBuffer   *syscall.Proc
+	procRead               *syscall.Proc
+	procReadChunked        *syscall.Proc
+	procReadToMemory       *syscall.Proc
+	procGPUReadback        *syscall.Proc
+	procOpenFile           *syscall.Proc
+	procCloseFile          *syscall.Proc
+	procEnqueueRead        *syscall.Proc
+	procSubmitAndWait      *syscall.Proc
+	procSubmit             *syscall.Proc
+	procIsComplete         *syscall.Proc
+	procWaitComplete       *syscall.Proc
+	procDebugShared        *syscall.Proc
+	procCudaAvailable      *syscall.Proc
+	procCreateSharedGPUBuf *syscall.Proc
+	procExportToCuda       *syscall.Proc
+	procCudaGetDevicePtr   *syscall.Proc
+	procCudaMemcpyToHost   *syscall.Proc
+	procCudaDestroy        *syscall.Proc
+	dllLoaded              bool
+	dllLoadAttempted       bool
 )
 
 func loadDLL() error {
@@ -103,6 +112,13 @@ func loadDLL() error {
 		{"ds_loader_submit", &procSubmit},
 		{"ds_loader_is_complete", &procIsComplete},
 		{"ds_loader_wait_complete", &procWaitComplete},
+		{"ds_loader_debug_shared", &procDebugShared},
+		{"ds_loader_cuda_available", &procCudaAvailable},
+		{"ds_loader_create_shared_gpu_buffer", &procCreateSharedGPUBuf},
+		{"ds_loader_export_to_cuda", &procExportToCuda},
+		{"ds_loader_cuda_get_device_ptr", &procCudaGetDevicePtr},
+		{"ds_loader_cuda_memcpy_to_host", &procCudaMemcpyToHost},
+		{"ds_loader_cuda_destroy", &procCudaDestroy},
 	}
 
 	for _, p := range procs {
@@ -480,5 +496,102 @@ func DefaultConfig() LoaderConfig {
 		DeviceIndex: 0,
 		BlockSize:   OptimalBlockSize(),
 		QueueDepth:  MaxQueueDepth(),
+	}
+}
+
+// --- CUDA interop (D3D12 <-> CUDA shared memory) ---
+
+// CUDAInterop holds a handle to a D3D12-CUDA shared memory mapping.
+// The underlying GPU memory is accessible by both DirectStorage (D3D12)
+// and CUDA/GGML compute kernels via the CUDA device pointer.
+type CUDAInterop struct {
+	handle uintptr // CUDAInteropHandle from native layer
+}
+
+// IsCudaAvailable checks if CUDA interop is supported (nvcuda.dll present, cuInit succeeds).
+func IsCudaAvailable() bool {
+	if err := loadDLL(); err != nil {
+		return false
+	}
+	ret, _, _ := procCudaAvailable.Call()
+	return ret == 1
+}
+
+// CreateSharedGPUBuffer allocates a D3D12 buffer with D3D12_HEAP_FLAG_SHARED,
+// suitable for both DirectStorage writes and CUDA interop export.
+// Use this instead of CreateGPUBuffer when you need CUDA access to the data.
+func (l *Loader) CreateSharedGPUBuffer(size uint64) (*GPUBuffer, error) {
+	if l.closed {
+		return nil, errors.New("loader is closed")
+	}
+	if size == 0 {
+		return nil, ErrInvalidArgument
+	}
+
+	ret, _, _ := procCreateSharedGPUBuf.Call(l.handle, uintptr(size))
+	if ret == 0 {
+		return nil, fmt.Errorf("%w: HRESULT=0x%08X", ErrBufferFailed, uint32(GetLastHResult()))
+	}
+
+	return &GPUBuffer{ptr: ret, size: size}, nil
+}
+
+// ExportToCuda exports a shared D3D12 GPU buffer to CUDA.
+// Creates a shared NT handle, imports into CUDA, and maps to a device pointer.
+// The gpuBuffer MUST have been created by CreateSharedGPUBuffer.
+// Returns a CUDAInterop handle that provides the CUDA device pointer.
+func (l *Loader) ExportToCuda(gpuBuffer *GPUBuffer) (*CUDAInterop, error) {
+	if l.closed {
+		return nil, errors.New("loader is closed")
+	}
+	if gpuBuffer == nil || gpuBuffer.ptr == 0 {
+		return nil, ErrInvalidArgument
+	}
+
+	ret, _, _ := procExportToCuda.Call(l.handle, gpuBuffer.ptr, uintptr(gpuBuffer.size))
+	if ret == 0 {
+		return nil, fmt.Errorf("%w: HRESULT=0x%08X", ErrCudaInteropFailed, uint32(GetLastHResult()))
+	}
+
+	return &CUDAInterop{handle: ret}, nil
+}
+
+// DevicePtr returns the CUDA device pointer (CUdeviceptr) for this interop mapping.
+// This pointer can be passed to CUDA/GGML compute kernels.
+func (ci *CUDAInterop) DevicePtr() uint64 {
+	if ci == nil || ci.handle == 0 {
+		return 0
+	}
+	ret, _, _ := procCudaGetDevicePtr.Call(ci.handle)
+	return uint64(ret)
+}
+
+// MemcpyToHost copies data from the CUDA device pointer to host memory.
+// Useful for verification and testing of the interop path.
+func (ci *CUDAInterop) MemcpyToHost(dest []byte) error {
+	if ci == nil || ci.handle == 0 {
+		return ErrCudaNotAvailable
+	}
+	if len(dest) == 0 {
+		return ErrInvalidArgument
+	}
+
+	ret, _, _ := procCudaMemcpyToHost.Call(
+		ci.handle,
+		uintptr(unsafe.Pointer(&dest[0])),
+		uintptr(len(dest)),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("CUDA memcpy DtoH failed")
+	}
+	return nil
+}
+
+// Destroy releases the CUDA interop handle, freeing the CUDA device pointer,
+// external memory object, and shared NT handle.
+func (ci *CUDAInterop) Destroy() {
+	if ci != nil && ci.handle != 0 {
+		procCudaDestroy.Call(ci.handle)
+		ci.handle = 0
 	}
 }

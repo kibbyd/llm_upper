@@ -547,3 +547,264 @@ func formatSize(bytes int) string {
 	}
 	return fmt.Sprintf("%dKB", bytes/1024)
 }
+
+// --- CUDA interop tests ---
+
+func TestDebugSharedHeap(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	ret, _, _ := procDebugShared.Call(loader.handle)
+	result := int(ret)
+	hr := GetLastHResult()
+
+	t.Logf("Debug result: 0x%X (decimal: %d)", result, result)
+	t.Logf("ResourceHeapTier: %d", result&0xFF)
+	t.Logf("Heap(SHARED only): %v", result&(1<<8) != 0)
+	t.Logf("Heap(SHARED+DENY): %v", result&(1<<9) != 0)
+	t.Logf("Placed(no flags): %v", result&(1<<10) != 0)
+	t.Logf("Placed(SIMULTANEOUS): %v", result&(1<<11) != 0)
+	t.Logf("Committed(SHARED): %v", result&(1<<12) != 0)
+	t.Logf("Last HRESULT: 0x%08X", uint32(hr))
+}
+
+func TestCudaAvailable(t *testing.T) {
+	available := IsCudaAvailable()
+	t.Logf("CUDA available: %v", available)
+
+	if available {
+		t.Log("CUDA interop is available — nvcuda.dll loaded, cuInit succeeded")
+	} else {
+		t.Log("CUDA not available — no NVIDIA GPU or driver")
+	}
+}
+
+func TestSharedGPUBuffer_CreateDestroy(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	buf, err := loader.CreateSharedGPUBuffer(65536)
+	if err != nil {
+		t.Fatalf("Failed to create shared GPU buffer: %v", err)
+	}
+
+	t.Logf("Shared GPU buffer created: size=%d", buf.size)
+	loader.DestroyGPUBuffer(buf)
+	t.Log("Shared GPU buffer destroyed")
+}
+
+func TestCudaInterop_ExportAndReadback(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	// Create test file with known data
+	size := uint64(64 * 1024) // 64KB
+	path, expected := createTestFile(t, int(size))
+
+	// Create shared GPU buffer (D3D12_HEAP_FLAG_SHARED)
+	buf, err := loader.CreateSharedGPUBuffer(size)
+	if err != nil {
+		t.Fatalf("Failed to create shared GPU buffer: %v", err)
+	}
+	defer loader.DestroyGPUBuffer(buf)
+
+	// Load data from SSD -> shared GPU buffer via DirectStorage
+	err = loader.LoadBlock(path, 0, size, buf)
+	if err != nil {
+		t.Fatalf("LoadBlock (SSD -> shared GPU) failed: %v", err)
+	}
+	t.Log("SSD -> shared GPU buffer: 64KB loaded via DirectStorage")
+
+	// Export D3D12 buffer to CUDA
+	interop, err := loader.ExportToCuda(buf)
+	if err != nil {
+		t.Fatalf("ExportToCuda failed: %v", err)
+	}
+	defer interop.Destroy()
+
+	devPtr := interop.DevicePtr()
+	t.Logf("CUDA device pointer: 0x%X", devPtr)
+	if devPtr == 0 {
+		t.Fatal("CUDA device pointer is NULL")
+	}
+
+	// Read data back via CUDA memcpy (CUDA device ptr -> host)
+	result := make([]byte, size)
+	err = interop.MemcpyToHost(result)
+	if err != nil {
+		t.Fatalf("MemcpyToHost failed: %v", err)
+	}
+
+	// Verify byte-perfect match
+	if !bytes.Equal(expected, result) {
+		t.Error("DATA MISMATCH! SSD -> DirectStorage -> D3D12 -> CUDA -> CPU roundtrip FAILED")
+		for i := range expected {
+			if expected[i] != result[i] {
+				t.Errorf("First difference at byte %d: expected 0x%02X, got 0x%02X", i, expected[i], result[i])
+				break
+			}
+		}
+	} else {
+		t.Log("SSD -> DirectStorage -> D3D12 shared buffer -> CUDA device ptr -> CPU: 64KB roundtrip VERIFIED!")
+	}
+}
+
+func TestCudaInterop_1MB(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	size := uint64(1024 * 1024) // 1MB
+	path, expected := createTestFile(t, int(size))
+
+	buf, err := loader.CreateSharedGPUBuffer(size)
+	if err != nil {
+		t.Fatalf("Failed to create shared GPU buffer: %v", err)
+	}
+	defer loader.DestroyGPUBuffer(buf)
+
+	err = loader.LoadBlock(path, 0, size, buf)
+	if err != nil {
+		t.Fatalf("LoadBlock failed: %v", err)
+	}
+
+	interop, err := loader.ExportToCuda(buf)
+	if err != nil {
+		t.Fatalf("ExportToCuda failed: %v", err)
+	}
+	defer interop.Destroy()
+
+	t.Logf("CUDA device pointer: 0x%X", interop.DevicePtr())
+
+	result := make([]byte, size)
+	err = interop.MemcpyToHost(result)
+	if err != nil {
+		t.Fatalf("MemcpyToHost failed: %v", err)
+	}
+
+	if !bytes.Equal(expected, result) {
+		t.Error("1MB SSD -> D3D12 -> CUDA -> CPU roundtrip FAILED")
+	} else {
+		t.Log("SSD -> D3D12 -> CUDA -> CPU: 1MB roundtrip VERIFIED!")
+	}
+}
+
+func TestCudaInterop_BatchedWithPrefetch(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	// Create a larger test file simulating multiple tensors
+	totalSize := 4 * 1024 * 1024 // 4MB total
+	path, fullData := createTestFile(t, totalSize)
+
+	// Simulate batched tensor loading: 4 x 1MB tensors into shared buffers
+	tensorSize := uint64(1024 * 1024) // 1MB each
+	numTensors := 4
+
+	err = loader.OpenFile(path)
+	if err != nil {
+		t.Fatalf("OpenFile failed: %v", err)
+	}
+	defer loader.CloseFile()
+
+	type tensorSlot struct {
+		buf     *GPUBuffer
+		interop *CUDAInterop
+		offset  uint64
+	}
+	slots := make([]tensorSlot, numTensors)
+
+	// Create shared buffers and enqueue reads
+	for i := 0; i < numTensors; i++ {
+		buf, err := loader.CreateSharedGPUBuffer(tensorSize)
+		if err != nil {
+			t.Fatalf("Failed to create shared GPU buffer %d: %v", i, err)
+		}
+		slots[i].buf = buf
+		slots[i].offset = uint64(i) * tensorSize
+
+		err = loader.EnqueueRead(slots[i].offset, tensorSize, buf, 0)
+		if err != nil {
+			t.Fatalf("EnqueueRead %d failed: %v", i, err)
+		}
+	}
+
+	// Single submit + wait for all 4 tensors
+	err = loader.SubmitAndWait()
+	if err != nil {
+		t.Fatalf("SubmitAndWait failed: %v", err)
+	}
+	t.Log("Batched load: 4 x 1MB tensors loaded into shared GPU buffers")
+
+	// Export all to CUDA and verify each via CUDA memcpy
+	for i := 0; i < numTensors; i++ {
+		interop, err := loader.ExportToCuda(slots[i].buf)
+		if err != nil {
+			t.Fatalf("ExportToCuda for tensor %d failed: %v", i, err)
+		}
+		slots[i].interop = interop
+
+		result := make([]byte, tensorSize)
+		err = interop.MemcpyToHost(result)
+		if err != nil {
+			t.Fatalf("MemcpyToHost for tensor %d failed: %v", i, err)
+		}
+
+		expected := fullData[slots[i].offset : slots[i].offset+tensorSize]
+		if !bytes.Equal(expected, result) {
+			t.Errorf("Tensor %d: data mismatch in CUDA readback", i)
+		} else {
+			t.Logf("Tensor %d: CUDA readback verified (offset=%d)", i, slots[i].offset)
+		}
+	}
+
+	// Cleanup
+	for i := 0; i < numTensors; i++ {
+		slots[i].interop.Destroy()
+		loader.DestroyGPUBuffer(slots[i].buf)
+	}
+	t.Log("Batched CUDA interop: 4 tensors verified byte-perfect!")
+}

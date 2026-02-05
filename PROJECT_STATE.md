@@ -176,12 +176,12 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `native/dstorage_loader.h` | 113 | C header defining the DLL's exported API (14 functions). Uses `DS_API` macro for `__declspec(dllexport)` when `DSTORAGE_EXPORTS` is defined, `__declspec(dllimport)` otherwise. |
-| `native/dstorage_loader.cpp` | ~540 | C++ implementation of the DirectStorage operations. Compiled with MSVC (cl.exe) into `dstorage_loader.dll`. Contains all D3D12 and DirectStorage COM code including batched reads with file handle caching. |
+| `native/dstorage_loader.h` | 172 | C header defining the DLL's exported API (23 functions). Uses `DS_API` macro for `__declspec(dllexport)` when `DSTORAGE_EXPORTS` is defined, `__declspec(dllimport)` otherwise. Includes `CUDAInteropHandle` typedef and 6 CUDA interop function declarations. |
+| `native/dstorage_loader.cpp` | ~1037 | C++ implementation of the DirectStorage operations. Compiled with MSVC (cl.exe) into `dstorage_loader.dll`. Contains all D3D12 and DirectStorage COM code including batched reads with file handle caching, CUDA driver API dynamic loading (nvcuda.dll), D3D12-CUDA interop via `cuImportExternalMemory`, and LUID-based GPU adapter matching. |
 | `native/diagnose.go` | 148 | Standalone Go diagnostic tool (has `//go:build ignore` tag, not part of the package). Run with `go run native/diagnose.go`. Checks Windows version, D3D12, DirectStorage DLL loading, and calls `ds_loader_available()`. |
-| `dstorage_windows.go` | 336 | Go bindings for Windows. Loads `dstorage_loader.dll` via `syscall.LoadDLL` (no CGO). Exposes the Go-level API: `Loader`, `GPUBuffer`, `IsAvailable()`, `NewLoader()`, `LoadBlock()`, `ReadToMemory()`, `GPUReadback()`, etc. Build tag: `//go:build windows` |
-| `dstorage_stub.go` | 68 | Stub implementation for non-Windows platforms. All functions return `ErrNotAvailable`. Build tag: `//go:build !windows` |
-| `dstorage_test.go` | 550 | Comprehensive test suite. Tests availability, loader lifecycle, SSD-to-CPU reads (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips (4KB, 1MB), throughput benchmarks. All tests pass. |
+| `dstorage_windows.go` | 598 | Go bindings for Windows. Loads `dstorage_loader.dll` via `syscall.LoadDLL` (no CGO). Exposes the Go-level API: `Loader`, `GPUBuffer`, `CUDAInterop`, `IsAvailable()`, `NewLoader()`, `LoadBlock()`, `ReadToMemory()`, `GPUReadback()`, `IsCudaAvailable()`, `CreateSharedGPUBuffer()`, `ExportToCuda()`, etc. Build tag: `//go:build windows` |
+| `dstorage_stub.go` | ~80 | Stub implementation for non-Windows platforms. All functions return `ErrNotAvailable`. Includes CUDA interop stubs. Build tag: `//go:build !windows` |
+| `dstorage_test.go` | 811 | Comprehensive test suite. 21 tests covering availability, loader lifecycle, SSD-to-CPU reads (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips (4KB, 1MB), throughput benchmarks, shared heap diagnostics, CUDA availability, shared GPU buffer lifecycle, CUDA interop export+readback (64KB, 1MB), and batched CUDA interop (4x1MB). All tests pass. |
 | `build.ps1` | 117 | PowerShell build script. Compiles C++ with cl.exe, links DLL with link.exe, then runs `go build` and `go test`. This is the primary build mechanism. |
 | `build.bat` | ~60 | Older CMD build script. Less reliable than build.ps1. Kept for reference but build.ps1 should be used instead. |
 
@@ -246,7 +246,9 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 │                                                          │
 │   Calls: dstorage.IsAvailable(), dstorage.NewLoader(),   │
 │          loader.LoadBlock(), loader.ReadToMemory(),       │
-│          loader.GPUReadback(), loader.CreateGPUBuffer()   │
+│          loader.GPUReadback(), loader.CreateGPUBuffer(),  │
+│          loader.CreateSharedGPUBuffer(),                  │
+│          loader.ExportToCuda(), interop.DevicePtr()       │
 └──────────────────────────┬──────────────────────────────┘
                            │ Go function calls
                            ▼
@@ -256,7 +258,7 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 │   Uses syscall.LoadDLL to load dstorage_loader.dll       │
 │   Uses syscall.Proc.Call() to invoke each C function     │
 │   Converts Go strings to UTF-16 wide strings             │
-│   Wraps raw pointers in GPUBuffer struct                  │
+│   Wraps raw pointers in GPUBuffer / CUDAInterop structs  │
 │   No CGO. No C compiler needed at Go build time.         │
 └──────────────────────────┬──────────────────────────────┘
                            │ syscall.Proc.Call() (Windows ABI)
@@ -264,17 +266,12 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 ┌─────────────────────────────────────────────────────────┐
 │           dstorage_loader.dll (C++, compiled by MSVC)    │
 │                                                          │
-│   Exports: ds_loader_available, ds_loader_create,        │
-│            ds_loader_destroy, ds_loader_read,             │
-│            ds_loader_read_chunked,                        │
-│            ds_loader_read_to_memory,                      │
-│            ds_loader_create_gpu_buffer,                   │
-│            ds_loader_destroy_gpu_buffer,                  │
-│            ds_loader_gpu_readback,                        │
-│            ds_loader_get_hresult,                         │
-│            ds_loader_open_file, ds_loader_close_file,     │
-│            ds_loader_enqueue_read,                        │
-│            ds_loader_submit_and_wait                      │
+│   23 exports: DirectStorage ops (17) + CUDA interop (6)  │
+│                                                          │
+│   LUID matching: On create, queries CUDA device LUID     │
+│   via cuDeviceGetLuid, then creates D3D12 device on      │
+│   the matching DXGI adapter (not the system default).    │
+│   This ensures D3D12 and CUDA use the same physical GPU. │
 │                                                          │
 │   Internally creates D3D12 device + DirectStorage        │
 │   factory + two DirectStorage queues (one for GPU         │
@@ -282,36 +279,44 @@ This is a Go package within the Ollama source tree. It provides DirectStorage bi
 │                                                          │
 │   Uses GetProcAddress to dynamically load                 │
 │   DStorageGetFactory from dstorage.dll                    │
-└──────────┬──────────────────────────────┬───────────────┘
-           │ LoadLibraryW + GetProcAddress │ D3D12 COM calls
-           ▼                              ▼
-┌──────────────────┐    ┌─────────────────────────────────┐
-│   dstorage.dll   │    │        D3D12 (system)            │
-│   (Microsoft     │    │                                   │
-│   redistributable│    │  D3D12CreateDevice()              │
-│   from NuGet)    │    │  CreateCommittedResource()        │
-│                  │    │  CreateCommandQueue/List()         │
-│  Loads           │    │  CopyBufferRegion() (readback)    │
-│  dstoragecore.dll│    └─────────────────────────────────┘
-│  internally      │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────┐
-│ dstoragecore.dll │
-│ (Microsoft core  │
-│  implementation) │
-│                  │
-│  Manages NVMe    │
-│  queue, DMA      │
-│  transfers,      │
-│  GPU upload      │
-└──────────────────┘
-         │
-         ▼
-    ┌─────────┐
-    │ NVMe SSD │ ──DMA──> GPU VRAM
-    └─────────┘
+│   Uses GetProcAddress to dynamically load                 │
+│   CUDA driver API from nvcuda.dll                        │
+└──────────┬─────────────────┬───────────────┬────────────┘
+           │                 │               │
+           ▼                 ▼               ▼
+┌──────────────┐ ┌─────────────────┐ ┌──────────────────┐
+│ dstorage.dll │ │ D3D12 (system)  │ │ nvcuda.dll       │
+│ (Microsoft   │ │                 │ │ (NVIDIA driver)  │
+│ redistrib.)  │ │ D3D12Device on  │ │                  │
+│              │ │ NVIDIA adapter  │ │ cuImportExternal │
+│ Loads        │ │ (LUID matched)  │ │ Memory (heap)    │
+│ dstoragecore │ │ CreateHeap      │ │ cuExtMemGet      │
+│ .dll         │ │ (SHARED)        │ │ MappedBuffer     │
+└──────┬───────┘ │ CreatePlaced    │ │ → CUdeviceptr    │
+       │         │ Resource        │ └────────┬─────────┘
+       ▼         │ CreateShared    │          │
+┌──────────────┐ │ Handle (NT)     │          │
+│dstoragecore  │ └────────┬────────┘          │
+│.dll          │          │                   │
+│              │          ▼                   ▼
+│ NVMe queue,  │   D3D12 shared heap ←→ CUDA device ptr
+│ DMA transfers│   (same GPU via LUID)   (accessible by GGML)
+└──────┬───────┘
+       │
+       ▼
+  ┌─────────┐
+  │ NVMe SSD │ ──DMA──> GPU VRAM (NVIDIA RTX 4060)
+  └─────────┘
+```
+
+### D3D12-CUDA Interop Data Flow
+
+```
+SSD file → DirectStorage DMA → Placed D3D12 Resource on Shared Heap → CUDA device pointer → GGML compute
+                                         │                                    │
+                                    CreateHeap(SHARED)              cuImportExternalMemory
+                                    CreatePlacedResource            cuExternalMemoryGetMappedBuffer
+                                    CreateSharedHandle(heap)        → CUdeviceptr
 ```
 
 ### Critical Design Decision: No CGO
@@ -333,7 +338,7 @@ Our DLL does NOT statically link to `dstorage.lib`. Instead, it uses `LoadLibrar
 
 ## 6. THE NATIVE C API
 
-These are the 17 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
+These are the 23 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
 
 ### `int ds_loader_available()`
 Checks if DirectStorage is usable on this system. Internally:
@@ -430,6 +435,54 @@ Copies data from a GPU buffer back to CPU memory. Used for testing and verificat
 7. Unmaps and cleans up
 - Returns 0 on success, -1 on failure
 
+### `int ds_loader_debug_shared(DSLoaderHandle loader)`
+Diagnostic function that tests shared heap capabilities. Returns a bitmask:
+- Bits 0-7: `ResourceHeapTier` (1 or 2)
+- Bit 8: `CreateHeap(D3D12_HEAP_FLAG_SHARED)` succeeds
+- Bit 9: `CreateHeap(SHARED + DENY_RT_DS + DENY_NON_RT_DS)` succeeds (buffer-only)
+- Bit 10: `CreatePlacedResource` with `D3D12_RESOURCE_FLAG_NONE` succeeds
+- Bit 11: `CreatePlacedResource` with `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` succeeds
+- Bit 12: `CreateCommittedResource` with `D3D12_HEAP_FLAG_SHARED` succeeds
+
+On the RTX 4060 Laptop GPU, the result is `0x702` (Tier 2, shared heap works, placed resources work WITHOUT simultaneous access, committed shared fails).
+
+### `int ds_loader_cuda_available()`
+Checks if CUDA interop is supported. Dynamically loads `nvcuda.dll`, calls `cuInit(0)`, obtains a CUDA device and context. Returns 1 if CUDA is available, 0 if not. All CUDA functions are loaded via `LoadLibraryW`/`GetProcAddress` — no CUDA SDK required at compile time.
+
+### `void* ds_loader_create_shared_gpu_buffer(DSLoaderHandle loader, uint64_t size)`
+Creates a D3D12 buffer suitable for both DirectStorage writes and CUDA interop export. Internally:
+1. Aligns `size` up to 64KB (D3D12 resource placement alignment)
+2. Creates a `D3D12_HEAP_FLAG_SHARED` heap with `DENY_RT_DS_TEXTURES | DENY_NON_RT_DS_TEXTURES` (buffer-only)
+3. Creates a placed resource at offset 0 on the shared heap with `D3D12_RESOURCE_FLAG_NONE`
+4. Stores the heap in the loader's `sharedHeaps` map for later CUDA export
+- Returns opaque pointer (`ID3D12Resource*`) or NULL on failure
+
+### `CUDAInteropHandle ds_loader_export_to_cuda(DSLoaderHandle loader, void* shared_gpu_buffer, uint64_t size)`
+Exports a shared D3D12 GPU buffer to CUDA. Internally:
+1. Looks up the shared heap for this resource
+2. Creates a shared NT handle from the D3D12 heap via `CreateSharedHandle`
+3. Sets the CUDA context current
+4. Imports the D3D12 heap into CUDA via `cuImportExternalMemory` with `CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP`
+5. Maps a buffer within the imported memory to a CUDA device pointer via `cuExternalMemoryGetMappedBuffer`
+6. Packages everything into a `CUDAInterop` struct
+- The `shared_gpu_buffer` MUST have been created by `ds_loader_create_shared_gpu_buffer`
+- Returns opaque handle or NULL on failure
+- Error encoding in `g_lastHR`: `0xCA` prefix = `cuImportExternalMemory` failure, `0xCB` = `cuExternalMemoryGetMappedBuffer`, `0xCC` = CUDA context error
+
+### `uint64_t ds_loader_cuda_get_device_ptr(CUDAInteropHandle interop)`
+Returns the CUDA device pointer (`CUdeviceptr` as `uint64`) from an interop handle. This pointer can be cast to a `float*` or used by GGML/CUDA compute kernels directly.
+
+### `int ds_loader_cuda_memcpy_to_host(CUDAInteropHandle interop, void* dest, uint64_t size)`
+Copies data from the CUDA device pointer to host memory via `cuMemcpyDtoH_v2`. Used for verification/testing.
+- Returns 0 on success, -1 on failure
+
+### `void ds_loader_cuda_destroy(CUDAInteropHandle interop)`
+Destroys a CUDA interop handle:
+1. Frees the CUDA device pointer via `cuMemFree_v2`
+2. Destroys the external memory object via `cuDestroyExternalMemory`
+3. Closes the shared NT handle
+4. Deletes the `CUDAInterop` struct
+
 ---
 
 ## 7. THE GO API
@@ -454,25 +507,32 @@ type LoaderConfig struct {
     BlockSize   uint64
     QueueDepth  uint32
 }
+
+type CUDAInterop struct {
+    handle uintptr  // CUDAInteropHandle from native layer
+}
 ```
 
 ### Error Variables
 
 ```go
-var ErrNotAvailable    // "DirectStorage not available on this system"
-var ErrInitFailed      // "failed to initialize DirectStorage"
-var ErrLoadFailed      // "failed to load block"
-var ErrQueueFull       // "DirectStorage queue full"
-var ErrInvalidArgument // "invalid argument"
-var ErrDLLNotFound     // "dstorage_loader.dll not found"
-var ErrBufferFailed    // "failed to create GPU buffer"
-var ErrReadbackFailed  // "GPU readback failed"
+var ErrNotAvailable      // "DirectStorage not available on this system"
+var ErrInitFailed        // "failed to initialize DirectStorage"
+var ErrLoadFailed        // "failed to load block"
+var ErrQueueFull         // "DirectStorage queue full"
+var ErrInvalidArgument   // "invalid argument"
+var ErrDLLNotFound       // "dstorage_loader.dll not found"
+var ErrBufferFailed      // "failed to create GPU buffer"
+var ErrReadbackFailed    // "GPU readback failed"
+var ErrCudaNotAvailable  // "CUDA not available"
+var ErrCudaInteropFailed // "CUDA interop failed"
 ```
 
 ### Package-level Functions
 
 ```go
 func IsAvailable() bool           // Checks if DirectStorage works on this system
+func IsCudaAvailable() bool       // Checks if CUDA interop is supported (nvcuda.dll + cuInit)
 func GetLastHResult() int32       // Returns last HRESULT for debugging
 func OptimalBlockSize() uint64    // Returns 65536 (64KB)
 func MaxQueueDepth() uint32       // Returns 2048 when available, 0 when not
@@ -502,6 +562,15 @@ func (l *Loader) SubmitAndWait() error
 func (l *Loader) Submit() error        // submit, return immediately
 func (l *Loader) IsComplete() bool     // non-blocking poll
 func (l *Loader) WaitComplete() error  // blocking wait
+
+// CUDA interop API (D3D12 <-> CUDA shared memory)
+func (l *Loader) CreateSharedGPUBuffer(size uint64) (*GPUBuffer, error) // D3D12_HEAP_FLAG_SHARED buffer
+func (l *Loader) ExportToCuda(gpuBuffer *GPUBuffer) (*CUDAInterop, error) // Export to CUDA device ptr
+
+// CUDAInterop methods
+func (ci *CUDAInterop) DevicePtr() uint64     // Returns CUDA device pointer (CUdeviceptr)
+func (ci *CUDAInterop) MemcpyToHost(dest []byte) error // GPU -> CPU copy via CUDA
+func (ci *CUDAInterop) Destroy()              // Release CUDA resources
 ```
 
 ### DLL Search Path
@@ -511,7 +580,7 @@ When the Go code loads `dstorage_loader.dll`, it searches these locations in ord
 2. Next to the Go source file (using `runtime.Caller(0)`)
 3. Current working directory: `dstorage_loader.dll`
 
-The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 17 proc addresses are resolved at load time.
+The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 24 proc addresses are resolved at load time.
 
 ---
 
@@ -655,6 +724,37 @@ Once `dstoragecore.dll` is already loaded in the process, `dstorage.dll` finds i
 
 **Workaround for future:** Split large reads into multiple 32MB (or smaller) requests, enqueue them all, then submit once. This can be done in the C API or the Go layer. For GGUF tensor loading, individual tensors are typically well under 32MB, so this is not an immediate blocker.
 
+### Bug 5: CUDA_ERROR_OPERATING_SYSTEM (304) from cuImportExternalMemory (CRITICAL, RESOLVED)
+
+**Problem:** `cuImportExternalMemory` failed with CUDA error 304 (`CUDA_ERROR_OPERATING_SYSTEM`) when trying to import a D3D12 shared heap into CUDA. The D3D12 shared heap creation succeeded, the shared handle creation succeeded, but the CUDA import always failed.
+
+**Root cause:** GPU device mismatch on a laptop with dual GPUs:
+- `D3D12CreateDevice(NULL, ...)` picked the system default adapter, which was the Intel integrated GPU
+- `cuDeviceGet(&device, 0)` picked CUDA device 0, which is the NVIDIA RTX 4060 Laptop GPU
+- The shared handle pointed to memory on the Intel iGPU, which the NVIDIA GPU's CUDA context cannot access
+- NVIDIA documents error 304 as "the D3D12 resource was created on a different device than the CUDA context"
+
+**Solution:** LUID matching in `ds_loader_create()`:
+1. Call `cuDeviceGetLuid()` to get the CUDA device's LUID (Locally Unique Identifier)
+2. Create `IDXGIFactory4` via `CreateDXGIFactory2(0, ...)`
+3. Call `EnumAdapterByLuid(cudaLuid)` to find the DXGI adapter matching the CUDA device
+4. Create the D3D12 device on THAT adapter instead of `D3D12CreateDevice(NULL, ...)`
+5. Falls back to default adapter if CUDA is not available
+
+This ensures ALL D3D12 operations (DirectStorage DMA, shared heaps, interop) happen on the same physical GPU as CUDA. All 21 tests pass after the fix.
+
+### Bug 6: CreateCommittedResource with D3D12_HEAP_FLAG_SHARED fails (HARDWARE CONSTRAINT, WORKED AROUND)
+
+**Problem:** `CreateCommittedResource` with `D3D12_HEAP_FLAG_SHARED` always returns `E_INVALIDARG` on this hardware (RTX 4060 Laptop GPU, Resource Heap Tier 2).
+
+**Workaround:** Use the heap-based approach:
+1. `CreateHeap(D3D12_HEAP_FLAG_SHARED | DENY_RT_DS | DENY_NON_RT_DS)` — creates a shared heap
+2. `CreatePlacedResource(heap, 0, ...)` with `D3D12_RESOURCE_FLAG_NONE` — places a buffer on the heap
+3. `CreateSharedHandle(heap, ...)` — exports the HEAP (not the resource) to a shared NT handle
+4. `cuImportExternalMemory` with `CU_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_HEAP` (type 4)
+
+Additional constraint: `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` CANNOT be used with placed resources on shared heaps on this hardware. Using `D3D12_RESOURCE_FLAG_NONE` works.
+
 ---
 
 ## 10. BENCHMARK RESULTS
@@ -753,12 +853,9 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 2. ~~**No multi-tensor batching:**~~ **RESOLVED.** `RequestLayerTensors()` now opens the file once, enqueues all non-resident tensors, and does a single submit+wait. File handles are cached across calls via `OpenFile`/`CloseFile`.
 
-3. **D3D12 buffer only:** The GPU buffers created by our API are D3D12 committed resources. CUDA/GGML cannot directly use D3D12 resources. For Ollama integration, we would need either:
-   - D3D12-CUDA interop (sharing GPU memory between D3D12 and CUDA)
-   - Or reading to CPU memory via `ReadToMemory` and then uploading to CUDA
-   - Or a CUDA-side approach using cuFile (GPUDirect Storage for Linux, not available on Windows)
+3. ~~**D3D12 buffer only:**~~ **RESOLVED.** D3D12-CUDA interop implemented via `CreateSharedGPUBuffer()` + `ExportToCuda()`. CUDA/GGML can now access DirectStorage-loaded data via CUDA device pointers. Full SSD→DirectStorage→D3D12→CUDA→CPU roundtrip verified byte-perfect at 64KB, 1MB, and 4MB (batched).
 
-4. **Single device:** The loader always uses the default GPU (`D3D12CreateDevice(NULL, ...)`). Multi-GPU is not supported.
+4. ~~**Single device / wrong GPU:**~~ **RESOLVED.** The loader now uses LUID matching: queries the CUDA device's LUID via `cuDeviceGetLuid`, then creates the D3D12 device on the matching DXGI adapter via `EnumAdapterByLuid`. This ensures D3D12 and CUDA always use the same physical GPU (NVIDIA RTX 4060), even on laptops with Intel iGPU + NVIDIA dGPU. Falls back to `D3D12CreateDevice(NULL, ...)` if CUDA is unavailable.
 
 5. **No GPU decompression:** DirectStorage supports GPU-based decompression (GDeflate), which could decompress quantized weights on the GPU during transfer. This is not yet implemented.
 
@@ -774,7 +871,7 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 1. **Research and planning** — Identified the five problems, understood the relationship between DirectStorage (runtime residency control) and MoE (model-level sparsity), documented hardware capabilities
 
-2. **DirectStorage C++ implementation** — Complete `dstorage_loader.dll` with 9 exported functions covering availability check, lifecycle management, GPU buffer management, SSD-to-GPU reads, SSD-to-CPU reads, and GPU readback
+2. **DirectStorage C++ implementation** — Complete `dstorage_loader.dll` with 23 exported functions covering availability check, lifecycle management, GPU buffer management, SSD-to-GPU reads, SSD-to-CPU reads, GPU readback, batched reads, async prefetching, and D3D12-CUDA interop
 
 3. **Critical bug fix** — Solved the `E_NOTIMPL` error by pre-loading `dstoragecore.dll` before `dstorage.dll` to work around Windows DLL search order differences between EXE and DLL contexts
 
@@ -820,17 +917,28 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Data verified byte-perfect via GPU readback
     - DLL now exports 17 functions total
 
+15. **D3D12-CUDA interop** — Implemented full D3D12-CUDA memory sharing. Added 6 new C++ exports and corresponding Go bindings. Key components:
+    - `ds_loader_cuda_available()`: Dynamically loads `nvcuda.dll` and initializes CUDA (no CUDA SDK required at compile time)
+    - `ds_loader_create_shared_gpu_buffer()`: Creates D3D12 buffer on a `D3D12_HEAP_FLAG_SHARED` heap, suitable for both DirectStorage writes and CUDA export
+    - `ds_loader_export_to_cuda()`: Creates shared NT handle from D3D12 heap, imports into CUDA via `cuImportExternalMemory` (heap type), maps to `CUdeviceptr` via `cuExternalMemoryGetMappedBuffer`
+    - `ds_loader_cuda_get_device_ptr()`, `ds_loader_cuda_memcpy_to_host()`, `ds_loader_cuda_destroy()`: Device pointer access, GPU→CPU copy for verification, cleanup
+    - **LUID matching in `ds_loader_create()`**: Queries CUDA device's LUID via `cuDeviceGetLuid`, creates `IDXGIFactory4` via `CreateDXGIFactory2`, finds matching adapter via `EnumAdapterByLuid`, creates D3D12 device on that adapter. This fixed `CUDA_ERROR_OPERATING_SYSTEM` (304) error caused by D3D12 picking Intel iGPU while CUDA was on NVIDIA dGPU.
+    - Hardware constraint discovered: `D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS` cannot be used with placed resources on shared heaps; `CreateCommittedResource` with `D3D12_HEAP_FLAG_SHARED` always fails with `E_INVALIDARG` on this hardware
+    - DLL now exports 23 functions total (17 original + 6 CUDA interop)
+    - All 21 tests pass including 3 new CUDA interop tests (64KB, 1MB, 4MB batched)
+    - SSD → DirectStorage → D3D12 shared buffer → CUDA device pointer → CPU readback: byte-perfect match verified
+
 ---
 
 ## 14. WHAT WAS NOT DONE YET
 
-1. ~~Chunked reads for >32MB~~ — **DONE.** `ds_loader_read_chunked()` splits large reads into <=32MB chunks, enqueues all, submits once. `LoadBlock()` auto-selects single vs chunked path. Tested: `output.weight` (426MB) at 1,427 MB/s, `token_embd.weight` (292MB) at 1,381 MB/s. Full 4.36GB model loads in 5.6 seconds.
+1. ~~Chunked reads for >32MB~~ — **DONE.** See Section 13, item 12.
 
-2. ~~**File handle caching**~~ — **DONE.** `ds_loader_open_file` caches `IDStorageFile` handles; `ds_loader_enqueue_read` uses them for batch enqueuing; `ds_loader_submit_and_wait` submits once. Full model loads 14.5% faster.
+2. ~~**File handle caching**~~ — **DONE.** See Section 13, item 13.
 
-3. ~~**Request batching**~~ — **DONE.** `RequestLayerTensors()` now batches all non-resident tensor reads into a single submit+wait cycle.
+3. ~~**Request batching**~~ — **DONE.** See Section 13, item 13.
 
-4. **D3D12-CUDA interop** — No code to share D3D12 GPU buffers with CUDA. This is required for GGML/Ollama to compute on the loaded data. The GPU buffers created by DirectStorage are D3D12 resources; CUDA cannot read them without explicit interop.
+4. ~~**D3D12-CUDA interop**~~ — **DONE.** See Section 13, item 15. Full D3D12-CUDA memory sharing with LUID matching, shared heaps, and CUDA device pointers. Verified byte-perfect across 21 tests.
 
 5. **Ollama integration** — No modifications to Ollama's model loading code. The dstorage package exists in the Ollama source tree but nothing references it.
 
@@ -838,44 +946,42 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 7. **GPU decompression** — DirectStorage supports GDeflate decompression on the GPU during transfer. Not implemented.
 
-8. ~~**Prefetching**~~ — **DONE.** `PrefetchEnabled=true` on the streamer auto-prefetches next layer during compute. I/O wait reduced 73%.
+8. ~~**Prefetching**~~ — **DONE.** See Section 13, item 14.
 
 9. **Streamer tests** — No unit tests for the `streamer/` package yet. The demo validates behavior but formal tests are needed.
+
+10. **Streamer CUDA integration** — The `streamer/` package still creates standard GPU buffers (`CreateGPUBuffer`). It should be updated to optionally use `CreateSharedGPUBuffer` + `ExportToCuda` so that prefetched tensors are directly accessible by CUDA/GGML.
 
 ---
 
 ## 15. RECOMMENDED NEXT STEPS
 
-The standalone GGUF tensor streamer is now COMPLETE (see Section 13, items 9-11). The next priorities are:
-
 ### ~~Priority 1: Chunked Reads for >32MB Tensors~~ — DONE
-
-Implemented `ds_loader_read_chunked()`. Full model loads in 5.6 seconds. See Section 13, item 12.
 
 ### ~~Priority 1 (new): File Handle Caching + Request Batching~~ — DONE
 
-Implemented 4 new C++ exports + Go bindings + streamer integration. Full model loads 14.5% faster (4.86s at 962 MB/s vs 5.6s at 840 MB/s). See Section 13, item 13.
-
 ### ~~Priority 1 (new): Prefetching~~ — DONE
 
-Implemented async submit/poll/wait + automatic next-layer prefetching in the streamer. I/O wait reduced 73%, total time reduced 48% with 100ms simulated compute. See Section 13, item 14.
+### ~~Priority 1 (new): D3D12-CUDA Interop~~ — DONE
 
-### Priority 1 (new): D3D12-CUDA Interop
+Implemented full D3D12-CUDA memory sharing with LUID matching, shared heaps, CUDA device pointers, and cleanup. All 21 tests pass. See Section 13, item 15.
 
-While one layer is being "processed" (simulated compute), prefetch the next layer's tensors in the background. This overlaps SSD I/O with computation and hides latency.
+### Priority 1 (current): Ollama Integration
 
-### Priority 4: D3D12-CUDA Interop
+The streamer can now replace Ollama's standard model loading path for models that exceed VRAM. The data path is:
+1. SSD → DirectStorage DMA → D3D12 shared buffer (via `CreateSharedGPUBuffer`)
+2. D3D12 shared buffer → CUDA device pointer (via `ExportToCuda`)
+3. CUDA device pointer → GGML compute (cast to `float*`)
 
-To actually use the loaded data for inference, CUDA must be able to read the D3D12 GPU buffers. Options:
-- `cudaImportExternalMemory()` with `cudaExternalMemoryHandleTypeD3D12Resource`
-- Or read back to CPU and re-upload to CUDA (defeats the purpose of DirectStorage)
-- Or investigate NVIDIA's GPUDirect Storage (for Linux only, may not help on Windows)
+The integration point is `ml/backend/ggml/ggml.go` where `Backend.Load()` loads tensors. The streamer needs to be updated to use `CreateSharedGPUBuffer` instead of `CreateGPUBuffer`, and the CUDA device pointers need to be wired into GGML's tensor data pointers.
 
-This is required before any actual inference integration with Ollama.
+### Priority 2: Streamer CUDA Integration
 
-### Priority 5: Ollama Integration
+Update the `streamer/` package to optionally create shared GPU buffers and export them to CUDA. This gives the streamer direct CUDA device pointers that GGML can use.
 
-Once chunked reads, batching, and D3D12-CUDA interop are working, the streamer can replace Ollama's standard model loading path for models that exceed VRAM. The integration point is `ml/backend/ggml/ggml.go` where `Backend.Load()` loads tensors.
+### Priority 3: Problems 2, 3
+
+Activation checkpointing and sliding window KV cache — required for production use with 70B models but can be tackled after the basic inference path works.
 
 ---
 
@@ -889,3 +995,4 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Implemented chunked reads — no more 32MB limit. Full 4.36GB model loads in 5.6s at 840 MB/s
 - 2026-02-05: Implemented file handle caching + request batching — 4 new C++ exports, Go bindings, streamer batched path. Full model loads in 4.86s at 962 MB/s (14.5% improvement).
 - 2026-02-05: Implemented async prefetching — 3 new C++ exports (async submit/poll/wait), Go bindings, streamer auto-prefetch of next layer. I/O wait reduced 73% (5.43s→1.46s), total time reduced 48% (8.25s→4.27s) with 100ms simulated compute. DLL now exports 17 functions.
+- 2026-02-05: Implemented D3D12-CUDA interop — 6 new C++ exports (cuda_available, create_shared_gpu_buffer, export_to_cuda, cuda_get_device_ptr, cuda_memcpy_to_host, cuda_destroy). Dynamic nvcuda.dll loading, shared heap creation, cuImportExternalMemory with D3D12_HEAP type. Fixed GPU device mismatch (Bug 5) via LUID matching. DLL now exports 23 functions. All 21 tests pass including SSD→D3D12→CUDA→CPU byte-perfect roundtrip.

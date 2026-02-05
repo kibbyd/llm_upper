@@ -9,14 +9,16 @@ import (
 )
 
 var (
-	ErrNotAvailable    = errors.New("DirectStorage not available on this system")
-	ErrInitFailed      = errors.New("failed to initialize DirectStorage")
-	ErrLoadFailed      = errors.New("failed to load block")
-	ErrQueueFull       = errors.New("DirectStorage queue full")
-	ErrInvalidArgument = errors.New("invalid argument")
-	ErrDLLNotFound     = errors.New("dstorage_loader.dll not found")
-	ErrBufferFailed    = errors.New("failed to create GPU buffer")
-	ErrReadbackFailed  = errors.New("GPU readback failed")
+	ErrNotAvailable      = errors.New("DirectStorage not available on this system")
+	ErrInitFailed        = errors.New("failed to initialize DirectStorage")
+	ErrLoadFailed        = errors.New("failed to load block")
+	ErrQueueFull         = errors.New("DirectStorage queue full")
+	ErrInvalidArgument   = errors.New("invalid argument")
+	ErrDLLNotFound       = errors.New("dstorage_loader.dll not found")
+	ErrBufferFailed      = errors.New("failed to create GPU buffer")
+	ErrReadbackFailed    = errors.New("GPU readback failed")
+	ErrCudaNotAvailable  = errors.New("CUDA not available")
+	ErrCudaInteropFailed = errors.New("CUDA interop failed")
 )
 
 // Loader manages DirectStorage operations
@@ -75,3 +77,18 @@ type LoaderConfig struct {
 func DefaultConfig() LoaderConfig {
 	return LoaderConfig{DeviceIndex: 0, BlockSize: 65536, QueueDepth: 0}
 }
+
+// --- CUDA interop stubs ---
+
+type CUDAInterop struct {
+	handle uintptr
+}
+
+func IsCudaAvailable() bool                                             { return false }
+func (l *Loader) CreateSharedGPUBuffer(size uint64) (*GPUBuffer, error) { return nil, ErrNotAvailable }
+func (l *Loader) ExportToCuda(gpuBuffer *GPUBuffer) (*CUDAInterop, error) {
+	return nil, ErrNotAvailable
+}
+func (ci *CUDAInterop) DevicePtr() uint64              { return 0 }
+func (ci *CUDAInterop) MemcpyToHost(dest []byte) error { return ErrNotAvailable }
+func (ci *CUDAInterop) Destroy()                       {}
