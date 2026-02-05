@@ -1,0 +1,871 @@
+# DirectStorage LLM Weight Streaming - Complete Project State
+
+This document contains every detail needed to understand, build, test, and continue this project. Nothing is summarized, abbreviated, or assumed. Any agent reading this should be able to pick up exactly where we left off.
+
+---
+
+## TABLE OF CONTENTS
+
+1. [Goal](#1-goal)
+2. [Hardware and Software Environment](#2-hardware-and-software-environment)
+3. [The Five Problems](#3-the-five-problems)
+4. [Project File Inventory](#4-project-file-inventory)
+5. [Architecture: How the Layers Connect](#5-architecture-how-the-layers-connect)
+6. [The Native C API (dstorage_loader.dll)](#6-the-native-c-api)
+7. [The Go API (package dstorage)](#7-the-go-api)
+8. [Build Process - Exact Steps](#8-build-process---exact-steps)
+9. [Bugs Encountered and Solutions](#9-bugs-encountered-and-solutions)
+10. [Benchmark Results](#10-benchmark-results)
+11. [Ollama Installation and Model Files](#11-ollama-installation-and-model-files)
+12. [Known Limitations](#12-known-limitations)
+13. [What Was Completed](#13-what-was-completed)
+14. [What Was NOT Done Yet](#14-what-was-not-done-yet)
+15. [Recommended Next Step](#15-recommended-next-step)
+
+---
+
+## 1. GOAL
+
+Run 70B-parameter Mixture-of-Experts (MoE) language models on an 8GB VRAM laptop GPU. A 70B MoE model has ~70 billion total parameters but only activates ~5-10 billion per token (via gating/routing). The model weights do not fit in VRAM or even in system RAM simultaneously. The solution is to stream weight tiles from the NVMe SSD directly to the GPU as needed, bypassing CPU and system RAM entirely, using Microsoft's DirectStorage API.
+
+This is not about making inference faster for models that already fit in memory. It is about making inference *possible* for models that do not fit.
+
+---
+
+## 2. HARDWARE AND SOFTWARE ENVIRONMENT
+
+### Hardware
+- **GPU:** NVIDIA GeForce RTX 4060 Laptop GPU, 8192 MB VRAM
+- **SSD:** NVMe, measured sequential read speed: 1642 MB/s (measured by reading 3184 MB in 1.94 seconds)
+- **CPU:** (not specifically documented, but running Windows 11)
+- **RAM:** (not specifically documented)
+
+### Operating System
+- **Windows 11**, Build 26200.7623
+- DirectStorage is NOT installed as a system component (no `dstorage.dll` or `dstoragecore.dll` in `C:\Windows\System32`). We use the redistributable DLLs from the NuGet package instead.
+
+### NVIDIA Driver and CUDA
+- **NVIDIA Driver:** 581.32
+- **CUDA:** 13.0
+- The GPU supports D3D12 Feature Level 12.1
+
+### Development Tools
+
+#### Visual Studio
+- **Version:** Visual Studio 18 Community (this is an unusual version number; it is NOT the typical "Visual Studio 2022" numbering)
+- **MSVC Compiler (cl.exe):** `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64\cl.exe`
+- **MSVC Linker (link.exe):** `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64\link.exe`
+- **MSVC Include:** `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\include`
+- **MSVC Lib (x64):** `C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.50.35717\lib\x64`
+
+#### Windows SDK
+- **SDK Version:** 10.0.26100.0
+- **Include paths:**
+  - `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um` (Windows API headers like d3d12.h)
+  - `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared` (shared headers like dxgi.h)
+  - `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\ucrt` (C runtime headers like stdio.h)
+  - `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\winrt` (WinRT headers including wrl/client.h for ComPtr)
+- **Library paths:**
+  - `C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64`
+  - `C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64`
+
+#### Go
+- **Version:** 1.25.6
+- Go is in the system PATH
+
+#### MinGW
+- **Installed at:** `C:\mingw64`
+- MinGW is NOT used for building this project. We use MSVC (cl.exe) for the C++ DLL and Go's standard toolchain for Go code. CGO is NOT used.
+
+#### Tools NOT Available
+- `winget` is not in PATH
+- NuGet CLI is not installed
+- Microsoft Store does not have a DirectStorage package
+
+### DirectStorage SDK
+- **Source:** NuGet package `Microsoft.Direct3D.DirectStorage.1.3.0`, obtained from the DirectStorage GitHub samples
+- **Cloned samples location:** `C:\Users\danie\Documents\treasure\UsersdanieDocumentsDirectStorage\`
+- **DirectStorage include path:** `C:\Users\danie\Documents\treasure\UsersdanieDocumentsDirectStorage\Samples\packages\Microsoft.Direct3D.DirectStorage.1.3.0\native\include`
+- **DirectStorage lib path (x64):** `C:\Users\danie\Documents\treasure\UsersdanieDocumentsDirectStorage\Samples\packages\Microsoft.Direct3D.DirectStorage.1.3.0\native\lib\x64`
+- **Key header files in the include directory:** `dstorage.h`, `dstorageerr.h`
+- **Key library files:** `dstorage.lib` (import library - we do NOT link against this; we use dynamic loading instead)
+- **Runtime DLLs (redistributable):**
+  - `dstorage.dll` (206,904 bytes) — thin shim that loads dstoragecore.dll
+  - `dstoragecore.dll` (1,482,784 bytes) — the actual DirectStorage implementation
+
+### HelloDirectStorage Sample (confirmed working)
+- **Location:** `C:\Users\danie\Documents\treasure\UsersdanieDocumentsDirectStorage\Samples\HelloDirectStorage\`
+- **Built executable:** `x64\Debug\HelloDirectStorage.exe`
+- **Tested with:** `HelloDirectStorage.exe HelloDirectStorage.exe` (reads itself as a test file)
+- **Result:** "The DirectStorage request completed successfully!" — this confirms DirectStorage works on this hardware
+
+---
+
+## 3. THE FIVE PROBLEMS
+
+These five problems must all be solved together to enable 70B MoE models on 8GB VRAM. They are interdependent.
+
+### Problem 1: DirectStorage SSD-to-GPU Streaming — STATUS: SOLVED
+Stream weight tiles directly from NVMe SSD to GPU VRAM, bypassing CPU and system RAM. This is the foundational infrastructure that the other four problems depend on.
+
+### Problem 2: Activation Checkpointing — STATUS: NOT STARTED
+During the forward pass, intermediate activations consume VRAM. Instead of storing them, recompute them when needed for the backward pass (or for multi-layer inference). This trades FLOPs for memory. Without this, intermediate computation state fills VRAM even after weights are streamed.
+
+### Problem 3: Sliding Window KV Cache — STATUS: NOT STARTED
+The key-value cache for attention grows linearly with context length. A sliding window approach keeps only the most recent N tokens' KV pairs, evicting old ones. Without this, long conversations consume unbounded VRAM regardless of model size.
+
+### Problem 4: Block-wise Tensor Loading — STATUS: PARTIALLY DONE
+Instead of loading entire tensors at once, load them in small contiguous tiles (for example, 64KB blocks). This works with DirectStorage's per-request size limit (32MB max) and enables fine-grained residency management. This is tightly coupled with Problem 1 — it decides WHAT to load and WHEN, while DirectStorage decides HOW.
+
+**What's done:** GGUF parser extracts tensor file offsets and sizes; LRU tensor residency manager loads/evicts whole tensors on demand; standalone demo proves layer-by-layer streaming works with real model files; chunked reads for >32MB tensors; file handle caching; request batching for multi-tensor loads.
+
+**What remains:** Sub-tensor tiling for fine-grained residency; prefetching.
+
+### Problem 5: Aggressive Quantization — STATUS: PARTIALLY DONE
+Reduce weight precision to shrink bandwidth requirements. Ollama already supports Q4 and Q8 quantization through GGML. Further compression (for example, 2-bit or 3-bit) could reduce the data that needs to be streamed by an additional 2-4x.
+
+### How They Connect
+
+```
+MoE model gating decides which expert weights are needed (model-level)
+        |
+        v
+Block-wise tensor loading (Problem 4) decides WHICH tiles to load
+        |
+        v
+DirectStorage (Problem 1) streams those tiles from SSD to GPU
+        |
+        v
+Quantization (Problem 5) shrinks the tiles so they transfer faster
+        |
+        v
+Sliding window KV cache (Problem 3) frees VRAM for incoming tiles
+        |
+        v
+Activation checkpointing (Problem 2) frees VRAM during computation
+        |
+        v
+Result: Only ~5-10B active parameters in VRAM at any moment
+        instead of 70B total parameters
+```
+
+Key insight from the research document (`idea.md`):
+- DirectStorage (Problem 1) controls WHERE weights live and WHEN they are loaded (runtime-side)
+- MoE gating controls WHICH weights participate in compute (model-side)
+- DirectStorage alone does not reduce compute. It reduces memory residency.
+- For a dense (non-MoE) model, ALL weight rows are needed for every token, so streaming helps with memory but not with bandwidth demand
+- For an MoE model, only the chosen experts' weights are needed, so streaming becomes practical because you only load a fraction of the total weights per token
+
+---
+
+## 4. PROJECT FILE INVENTORY
+
+### Planning and Research Files (in `C:\Users\danie\llmidea\`)
+
+| File | Purpose |
+|------|---------|
+| `idea.md` | The five problems defined, what solving them enables, the relationship between streaming and MoE |
+| `DIRECTSTORAGE_LLM_RESEARCH.md` | Hardware specs, measured SSD speeds, DirectStorage API overview, architecture diagram |
+| `PROJECT_STATE.md` | THIS FILE — complete project documentation |
+
+### DirectStorage Module (in `C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage\`)
+
+This is a Go package within the Ollama source tree. It provides DirectStorage bindings for Go without using CGO. The Go module path is `github.com/ollama/ollama` (the Ollama monorepo; go.mod is at `C:\Users\danie\Documents\ollama\go.mod`, Go version 1.24.1).
+
+#### Source Files
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `native/dstorage_loader.h` | 113 | C header defining the DLL's exported API (14 functions). Uses `DS_API` macro for `__declspec(dllexport)` when `DSTORAGE_EXPORTS` is defined, `__declspec(dllimport)` otherwise. |
+| `native/dstorage_loader.cpp` | ~540 | C++ implementation of the DirectStorage operations. Compiled with MSVC (cl.exe) into `dstorage_loader.dll`. Contains all D3D12 and DirectStorage COM code including batched reads with file handle caching. |
+| `native/diagnose.go` | 148 | Standalone Go diagnostic tool (has `//go:build ignore` tag, not part of the package). Run with `go run native/diagnose.go`. Checks Windows version, D3D12, DirectStorage DLL loading, and calls `ds_loader_available()`. |
+| `dstorage_windows.go` | 336 | Go bindings for Windows. Loads `dstorage_loader.dll` via `syscall.LoadDLL` (no CGO). Exposes the Go-level API: `Loader`, `GPUBuffer`, `IsAvailable()`, `NewLoader()`, `LoadBlock()`, `ReadToMemory()`, `GPUReadback()`, etc. Build tag: `//go:build windows` |
+| `dstorage_stub.go` | 68 | Stub implementation for non-Windows platforms. All functions return `ErrNotAvailable`. Build tag: `//go:build !windows` |
+| `dstorage_test.go` | 550 | Comprehensive test suite. Tests availability, loader lifecycle, SSD-to-CPU reads (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips (4KB, 1MB), throughput benchmarks. All tests pass. |
+| `build.ps1` | 117 | PowerShell build script. Compiles C++ with cl.exe, links DLL with link.exe, then runs `go build` and `go test`. This is the primary build mechanism. |
+| `build.bat` | ~60 | Older CMD build script. Less reliable than build.ps1. Kept for reference but build.ps1 should be used instead. |
+
+#### Binary/Runtime Files
+
+| File | Size | Source | Purpose |
+|------|------|--------|---------|
+| `dstorage.dll` | 206,904 bytes | Copied from NuGet package `native\bin\x64\dstorage.dll` | Microsoft's DirectStorage redistributable shim. Loads `dstoragecore.dll` internally. |
+| `dstoragecore.dll` | 1,482,784 bytes | Copied from NuGet package `native\bin\x64\dstoragecore.dll` | Microsoft's DirectStorage core implementation. |
+| `dstorage_loader.dll` | 17,408 bytes | Built by `build.ps1` | OUR compiled DLL. Contains the C API that Go calls into. |
+
+#### Build Artifacts (in `native/` subdirectory)
+
+| File | Purpose |
+|------|---------|
+| `native/dstorage_loader.obj` | MSVC object file from compilation |
+| `native/dstorage_loader.lib` | Import library generated by linker |
+| `native/dstorage_loader.exp` | Export file generated by linker |
+
+#### Build Log Files (can be deleted)
+
+| File | Purpose |
+|------|---------|
+| `build_stdout.txt` | Redirected stdout from cl.exe during build |
+| `build_stderr.txt` | Redirected stderr from cl.exe during build |
+| `link_stdout.txt` | Redirected stdout from link.exe during build |
+| `link_stderr.txt` | Redirected stderr from link.exe during build |
+
+#### GGUF Parser Package (in `dstorage/gguf/`)
+
+| File | Purpose |
+|------|---------|
+| `gguf/gguf.go` | Thin wrapper around Ollama's `fs/ggml.Decode()` that parses GGUF files and exposes tensor metadata (name, absolute file offset, byte size, type, shape) for DirectStorage streaming. Types: `TensorInfo`, `ModelInfo`. Functions: `Parse()`, `TensorByName()`, `LayerTensors()`. |
+
+#### Tensor Streamer Package (in `dstorage/streamer/`)
+
+| File | Purpose |
+|------|---------|
+| `streamer/streamer.go` | Tensor residency manager with LRU eviction. Maintains a GPU buffer pool within a configurable VRAM budget. Loads tensors from SSD via DirectStorage on demand. Types: `Streamer`, `Config`, `Stats`, `LoadEvent`. Functions: `New()`, `RequestTensor()`, `RequestLayerTensors()`, `IsResident()`, `EvictAll()`. |
+
+#### Tensor Demo Program (in `dstorage/cmd/tensor_demo/`)
+
+| File | Purpose |
+|------|---------|
+| `cmd/tensor_demo/main.go` | Standalone demo program. Parses a GGUF model file, lists tensors and layer structure, simulates layer-by-layer inference with streaming and LRU eviction, runs a second pass to demonstrate cache hit behavior, optionally verifies data integrity via GPU readback. Usage: `go run ./ml/backend/ggml/dstorage/cmd/tensor_demo/ -model <path> [-budget MB] [-layers N] [-verify]` |
+
+#### Other Files
+
+| File | Purpose |
+|------|---------|
+| `dstorage_loader.obj` | Stale object file in root directory (from older build attempt). Can be deleted. |
+| `README.md` | Older readme. Superseded by this document. |
+
+---
+
+## 5. ARCHITECTURE: HOW THE LAYERS CONNECT
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                     Go Test / Application                │
+│   dstorage_test.go  or  future Ollama integration        │
+│                                                          │
+│   Calls: dstorage.IsAvailable(), dstorage.NewLoader(),   │
+│          loader.LoadBlock(), loader.ReadToMemory(),       │
+│          loader.GPUReadback(), loader.CreateGPUBuffer()   │
+└──────────────────────────┬──────────────────────────────┘
+                           │ Go function calls
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│              dstorage_windows.go (Go, Windows only)      │
+│                                                          │
+│   Uses syscall.LoadDLL to load dstorage_loader.dll       │
+│   Uses syscall.Proc.Call() to invoke each C function     │
+│   Converts Go strings to UTF-16 wide strings             │
+│   Wraps raw pointers in GPUBuffer struct                  │
+│   No CGO. No C compiler needed at Go build time.         │
+└──────────────────────────┬──────────────────────────────┘
+                           │ syscall.Proc.Call() (Windows ABI)
+                           ▼
+┌─────────────────────────────────────────────────────────┐
+│           dstorage_loader.dll (C++, compiled by MSVC)    │
+│                                                          │
+│   Exports: ds_loader_available, ds_loader_create,        │
+│            ds_loader_destroy, ds_loader_read,             │
+│            ds_loader_read_chunked,                        │
+│            ds_loader_read_to_memory,                      │
+│            ds_loader_create_gpu_buffer,                   │
+│            ds_loader_destroy_gpu_buffer,                  │
+│            ds_loader_gpu_readback,                        │
+│            ds_loader_get_hresult,                         │
+│            ds_loader_open_file, ds_loader_close_file,     │
+│            ds_loader_enqueue_read,                        │
+│            ds_loader_submit_and_wait                      │
+│                                                          │
+│   Internally creates D3D12 device + DirectStorage        │
+│   factory + two DirectStorage queues (one for GPU         │
+│   buffer destinations, one for memory destinations)       │
+│                                                          │
+│   Uses GetProcAddress to dynamically load                 │
+│   DStorageGetFactory from dstorage.dll                    │
+└──────────┬──────────────────────────────┬───────────────┘
+           │ LoadLibraryW + GetProcAddress │ D3D12 COM calls
+           ▼                              ▼
+┌──────────────────┐    ┌─────────────────────────────────┐
+│   dstorage.dll   │    │        D3D12 (system)            │
+│   (Microsoft     │    │                                   │
+│   redistributable│    │  D3D12CreateDevice()              │
+│   from NuGet)    │    │  CreateCommittedResource()        │
+│                  │    │  CreateCommandQueue/List()         │
+│  Loads           │    │  CopyBufferRegion() (readback)    │
+│  dstoragecore.dll│    └─────────────────────────────────┘
+│  internally      │
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│ dstoragecore.dll │
+│ (Microsoft core  │
+│  implementation) │
+│                  │
+│  Manages NVMe    │
+│  queue, DMA      │
+│  transfers,      │
+│  GPU upload      │
+└──────────────────┘
+         │
+         ▼
+    ┌─────────┐
+    │ NVMe SSD │ ──DMA──> GPU VRAM
+    └─────────┘
+```
+
+### Critical Design Decision: No CGO
+
+We deliberately avoid CGO because:
+1. CGO on Windows invokes GCC (from MinGW), but our C++ code must be compiled with MSVC because it uses `__uuidof()`, COM smart pointers, and DirectStorage headers that are MSVC-specific
+2. MSVC does not accept GCC-style flags like `-Werror` that CGO injects
+3. By separating C++ compilation (MSVC) from Go compilation (gc), each toolchain operates in its comfort zone
+4. Go loads the DLL at runtime via `syscall.LoadDLL`, which is standard Windows DLL loading
+
+### Critical Design Decision: Dynamic Loading of dstorage.dll
+
+Our DLL does NOT statically link to `dstorage.lib`. Instead, it uses `LoadLibraryW` and `GetProcAddress` to load `dstorage.dll` at runtime. This is because:
+1. We need to control WHERE `dstorage.dll` is loaded from (same directory as our DLL)
+2. We need to pre-load `dstoragecore.dll` before `dstorage.dll` (see Bugs section)
+3. It avoids import table entries that would cause load-time failures if `dstorage.dll` is not found
+
+---
+
+## 6. THE NATIVE C API
+
+These are the 14 functions exported by `dstorage_loader.dll`. All use the C calling convention (`extern "C"`). All are marked with `DS_API` (`__declspec(dllexport)`).
+
+### `int ds_loader_available()`
+Checks if DirectStorage is usable on this system. Internally:
+1. Calls `CoInitializeEx(NULL, COINIT_MULTITHREADED)`
+2. Ensures `dstorage.dll` and `dstoragecore.dll` are loaded (via `EnsureDStorageLoaded()`)
+3. Calls `D3D12CreateDevice(NULL, D3D_FEATURE_LEVEL_12_1, ...)` to verify D3D12 works
+4. Calls `DStorageGetFactory(__uuidof(IDStorageFactory), ...)` to verify DirectStorage works
+5. Returns 1 if both succeed, 0 if either fails
+6. Sets `g_lastHR` to the failing HRESULT on failure
+
+### `int32_t ds_loader_get_hresult()`
+Returns the last HRESULT value from any failed operation. Useful for debugging. Common values:
+- `0x00000000` (S_OK) — success
+- `0x80004001` (E_NOTIMPL) — DirectStorage factory creation failed (was our main bug, now fixed)
+- `0x89240008` (E_DSTORAGE_REQUEST_TOO_LARGE) — single request exceeded 32MB
+
+### `DSLoaderHandle ds_loader_create()`
+Creates a DirectStorage loader instance. Internally:
+1. Creates a D3D12 device
+2. Gets the DirectStorage factory via `DStorageGetFactory`
+3. Creates two DirectStorage queues:
+   - `queue` — for GPU buffer destination requests (`DSTORAGE_REQUEST_DESTINATION_BUFFER`)
+   - `memQueue` — for memory destination requests (`DSTORAGE_REQUEST_DESTINATION_MEMORY`)
+4. Both queues have `DSTORAGE_MAX_QUEUE_CAPACITY` (8192) capacity
+5. Returns an opaque handle (pointer to internal `DSLoader` struct) or NULL on failure
+
+### `void ds_loader_destroy(DSLoaderHandle loader)`
+Destroys a loader created by `ds_loader_create`. Releases all COM objects (factory, queues, device).
+
+### `void* ds_loader_create_gpu_buffer(DSLoaderHandle loader, uint64_t size)`
+Creates a D3D12 committed resource on the GPU default heap. This is a buffer in VRAM that DirectStorage can write to directly. Returns an opaque pointer (`ID3D12Resource*`) or NULL on failure. The buffer is created with:
+- `D3D12_HEAP_TYPE_DEFAULT` (GPU-only memory)
+- `D3D12_RESOURCE_DIMENSION_BUFFER`
+- `D3D12_RESOURCE_STATE_COMMON`
+- `DXGI_FORMAT_UNKNOWN` with `D3D12_TEXTURE_LAYOUT_ROW_MAJOR`
+
+### `void ds_loader_destroy_gpu_buffer(void* gpu_buffer)`
+Releases a GPU buffer created by `ds_loader_create_gpu_buffer`. Calls `ID3D12Resource::Release()`.
+
+### `int ds_loader_read(DSLoaderHandle loader, const wchar_t* file_path, uint64_t file_offset, uint64_t size, void* gpu_buffer)`
+Reads data from a file directly to a GPU buffer (SSD -> VRAM, bypassing CPU). This is the core DirectStorage operation.
+- `file_path`: Wide string (UTF-16) path to the file
+- `file_offset`: Byte offset within the file to start reading
+- `size`: Number of bytes to read. **MUST be <= 33,554,432 (32MB).** Larger values cause `E_DSTORAGE_REQUEST_TOO_LARGE` (0x89240008).
+- `gpu_buffer`: Pointer returned by `ds_loader_create_gpu_buffer`
+- Returns 0 on success, -1 on failure
+- Internally: opens file via `IDStorageFactory::OpenFile`, creates a `DSTORAGE_REQUEST` with `DESTINATION_BUFFER`, enqueues it, submits the queue, waits for completion via D3D12 fence, checks for errors
+
+### `int ds_loader_read_chunked(DSLoaderHandle loader, const wchar_t* file_path, uint64_t file_offset, uint64_t total_size, void* gpu_buffer)`
+Reads data from a file to a GPU buffer with automatic chunking for sizes > 32MB. Internally:
+1. Opens the file once via `IDStorageFactory::OpenFile`
+2. Splits `total_size` into <=32MB chunks
+3. Enqueues one `DSTORAGE_REQUEST` per chunk, each writing to a different `Destination.Buffer.Offset` within the same GPU buffer
+4. Submits the queue once and waits via fence once
+- Returns 0 on success, -1 on failure
+- No size limit — handles any tensor size
+- This function is called automatically by the Go `LoadBlock()` when `size > 32MB`
+
+### `int ds_loader_read_to_memory(DSLoaderHandle loader, const wchar_t* file_path, uint64_t file_offset, uint64_t size, void* dest_memory)`
+Reads data from a file to CPU memory via DirectStorage. Same as `ds_loader_read` but uses `DSTORAGE_REQUEST_DESTINATION_MEMORY` instead of `DESTINATION_BUFFER`. Uses the `memQueue` instead of `queue`.
+- `dest_memory`: Pointer to CPU-allocated memory (for example, a Go `[]byte` slice)
+- Same 32MB per-request limit applies
+
+### `int ds_loader_open_file(DSLoaderHandle loader, const wchar_t* file_path)`
+Opens a file and caches the `IDStorageFile` handle inside the loader. If the same file is already cached, this is a no-op (returns 0 immediately). Subsequent `ds_loader_enqueue_read` calls use this cached handle instead of opening the file each time.
+- Returns 0 on success, -1 on failure
+- Replaces any previously cached file handle
+
+### `void ds_loader_close_file(DSLoaderHandle loader)`
+Releases the cached `IDStorageFile` handle. Optional — the handle is also released when the loader is destroyed or when a different file is opened.
+
+### `int ds_loader_enqueue_read(DSLoaderHandle loader, uint64_t file_offset, uint64_t size, void* gpu_buffer, uint64_t buffer_offset)`
+Enqueues a single read request using the cached file handle. Does NOT submit — call `ds_loader_submit_and_wait` after enqueuing all requests for the batch.
+- `file_offset`: Byte offset within the file
+- `size`: Number of bytes to read. Automatically splits into ≤32MB chunks if needed.
+- `gpu_buffer`: D3D12 resource pointer from `ds_loader_create_gpu_buffer`
+- `buffer_offset`: Byte offset within the GPU buffer to write to (usually 0 for separate buffers)
+- Returns 0 on success, -1 on failure
+- Requires `ds_loader_open_file` to have been called first (returns E_HANDLE otherwise)
+
+### `int ds_loader_submit_and_wait(DSLoaderHandle loader)`
+Submits all enqueued requests and waits for completion via D3D12 fence.
+- Returns 0 on success, -1 on failure
+- After this call, all previously enqueued reads are complete and GPU buffers contain the data
+
+### `int ds_loader_gpu_readback(DSLoaderHandle loader, void* gpu_buffer, uint64_t size, void* dest_memory)`
+Copies data from a GPU buffer back to CPU memory. Used for testing and verification. Internally:
+1. Creates a D3D12 readback buffer (`D3D12_HEAP_TYPE_READBACK`)
+2. Creates a D3D12 copy command queue and command list (`D3D12_COMMAND_LIST_TYPE_COPY`)
+3. Records a `CopyBufferRegion` command
+4. Executes the command list
+5. Waits for completion via D3D12 fence
+6. Maps the readback buffer and copies data to `dest_memory` via `memcpy`
+7. Unmaps and cleans up
+- Returns 0 on success, -1 on failure
+
+---
+
+## 7. THE GO API
+
+Package: `github.com/ollama/ollama/ml/backend/ggml/dstorage`
+
+### Types
+
+```go
+type Loader struct {
+    handle uintptr  // Opaque pointer to native DSLoader
+    closed bool
+}
+
+type GPUBuffer struct {
+    ptr  uintptr  // ID3D12Resource* from native layer
+    size uint64   // Size in bytes
+}
+
+type LoaderConfig struct {
+    DeviceIndex uint32
+    BlockSize   uint64
+    QueueDepth  uint32
+}
+```
+
+### Error Variables
+
+```go
+var ErrNotAvailable    // "DirectStorage not available on this system"
+var ErrInitFailed      // "failed to initialize DirectStorage"
+var ErrLoadFailed      // "failed to load block"
+var ErrQueueFull       // "DirectStorage queue full"
+var ErrInvalidArgument // "invalid argument"
+var ErrDLLNotFound     // "dstorage_loader.dll not found"
+var ErrBufferFailed    // "failed to create GPU buffer"
+var ErrReadbackFailed  // "GPU readback failed"
+```
+
+### Package-level Functions
+
+```go
+func IsAvailable() bool           // Checks if DirectStorage works on this system
+func GetLastHResult() int32       // Returns last HRESULT for debugging
+func OptimalBlockSize() uint64    // Returns 65536 (64KB)
+func MaxQueueDepth() uint32       // Returns 2048 when available, 0 when not
+func DefaultConfig() LoaderConfig // Returns {DeviceIndex:0, BlockSize:65536, QueueDepth:2048}
+func NewLoader(deviceIndex uint32) (*Loader, error) // Creates a new loader
+```
+
+### Loader Methods
+
+```go
+func (l *Loader) Close() error
+func (l *Loader) CreateGPUBuffer(size uint64) (*GPUBuffer, error)
+func (l *Loader) DestroyGPUBuffer(buf *GPUBuffer)
+func (l *Loader) LoadBlock(filePath string, fileOffset uint64, size uint64, gpuBuffer *GPUBuffer) error
+func (l *Loader) LoadBlockRaw(filePath string, fileOffset uint64, size uint64, gpuPtr unsafe.Pointer) error
+func (l *Loader) ReadToMemory(filePath string, fileOffset uint64, size uint64, dest []byte) error
+func (l *Loader) GPUReadback(gpuBuffer *GPUBuffer, dest []byte) error
+func (l *Loader) LoadTensor(filePath string, tensorOffset uint64, tensorSize uint64, gpuBuffer *GPUBuffer) error
+
+// Batched read API (file handle caching + multi-request submit)
+func (l *Loader) OpenFile(filePath string) error
+func (l *Loader) CloseFile()
+func (l *Loader) EnqueueRead(fileOffset uint64, size uint64, gpuBuffer *GPUBuffer, bufferOffset uint64) error
+func (l *Loader) SubmitAndWait() error
+```
+
+### DLL Search Path
+
+When the Go code loads `dstorage_loader.dll`, it searches these locations in order:
+1. Hardcoded: `C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage\dstorage_loader.dll`
+2. Next to the Go source file (using `runtime.Caller(0)`)
+3. Current working directory: `dstorage_loader.dll`
+
+The DLL loading is attempted only once (guarded by `dllLoadAttempted` flag). All 14 proc addresses are resolved at load time.
+
+---
+
+## 8. BUILD PROCESS - EXACT STEPS
+
+### Prerequisites
+1. Visual Studio 18 Community must be installed with C++ workload
+2. Windows SDK 10.0.26100.0 must be installed
+3. Go 1.25.6 must be in PATH
+4. The three runtime DLLs (`dstorage.dll`, `dstoragecore.dll`, `dstorage_loader.dll`) must be in the dstorage directory
+
+### How to Build
+
+Open PowerShell (NOT cmd.exe) and run:
+
+```powershell
+cd C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage
+.\build.ps1
+```
+
+### What build.ps1 Does (4 steps)
+
+**Step 1: Compile C++ to object file**
+```
+cl.exe /c /O2 /EHsc /std:c++17 /DWIN32_LEAN_AND_MEAN /DNOMINMAX /DDSTORAGE_EXPORTS
+    /I"<VS include>"
+    /I"<DirectStorage include>"
+    /I"<SDK um>"
+    /I"<SDK shared>"
+    /I"<SDK ucrt>"
+    /I"<SDK winrt>"
+    /Fo:"native\dstorage_loader.obj"
+    "native\dstorage_loader.cpp"
+```
+
+The `/DDSTORAGE_EXPORTS` define causes `DS_API` to expand to `__declspec(dllexport)`.
+
+The `/I"<SDK winrt>"` include is needed for `<wrl/client.h>` which provides `Microsoft::WRL::ComPtr`.
+
+**Step 2: Link object file to DLL**
+```
+link.exe /DLL
+    /OUT:"dstorage_loader.dll"
+    /IMPLIB:"native\dstorage_loader.lib"
+    /LIBPATH:"<VS lib>"
+    /LIBPATH:"<SDK um lib>"
+    /LIBPATH:"<SDK ucrt lib>"
+    dxgi.lib d3d12.lib ole32.lib kernel32.lib ucrt.lib msvcrt.lib
+    "native\dstorage_loader.obj"
+```
+
+Note: `dstorage.lib` is NOT linked. We load `dstorage.dll` dynamically at runtime via `LoadLibraryW`/`GetProcAddress`.
+
+The linker produces a warning: `LINK : warning LNK4098: defaultlib 'LIBCMT' conflicts with use of other libs; use /NODEFAULTLIB:library`. This is harmless and does not affect functionality.
+
+**Step 3: Build Go package**
+```
+go build -v
+```
+
+This compiles `dstorage_windows.go` (on Windows) or `dstorage_stub.go` (on other platforms). No C compiler is invoked because we do not use CGO.
+
+**Step 4: Run Go tests**
+```
+go test -v
+```
+
+Runs all tests in `dstorage_test.go`.
+
+### How to Run the Diagnostic
+
+```powershell
+cd C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage
+go run native/diagnose.go
+```
+
+This is a standalone Go program (not part of the package due to `//go:build ignore`). It checks Windows version, D3D12, DirectStorage DLLs, and calls `ds_loader_available()`.
+
+### How to Run Benchmarks
+
+```powershell
+cd C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage
+go test -v -run TestThroughput
+go test -bench=. -benchmem
+```
+
+---
+
+## 9. BUGS ENCOUNTERED AND SOLUTIONS
+
+### Bug 1: CGO + MSVC Incompatibility (EARLY, RESOLVED BY DESIGN)
+
+**Problem:** CGO invokes GCC (MinGW) on Windows. GCC passes flags like `-Werror` to the compiler. MSVC (cl.exe) does not understand GCC flags. The DirectStorage headers use MSVC-specific features like `__uuidof()` and `#pragma comment(lib, ...)` that GCC does not support.
+
+**Solution:** Abandoned CGO entirely. Separated the build into two independent steps:
+1. MSVC compiles C++ into a DLL (`dstorage_loader.dll`)
+2. Go loads the DLL at runtime via `syscall.LoadDLL`
+
+This means no C compiler is needed when building the Go code.
+
+### Bug 2: E_NOTIMPL (0x80004001) from DStorageGetFactory (CRITICAL, RESOLVED)
+
+**Problem:** `DStorageGetFactory()` returned `0x80004001` (E_NOTIMPL) when called from our DLL, but worked perfectly from the HelloDirectStorage sample EXE.
+
+**Investigation steps:**
+1. Confirmed HelloDirectStorage.exe works — DirectStorage is supported on this hardware
+2. Both our DLL and the sample use the same `dstorage.dll` and `dstoragecore.dll` (identical file sizes: 206,904 and 1,482,784 bytes)
+3. Created a minimal test EXE (`test_dstorage.cpp`) that dynamically loads `dstorage.dll` the same way — it worked perfectly
+4. The test EXE showed that `dstoragecore.dll` loads lazily when `DStorageGetFactory` is called
+
+**Root cause:** When code runs inside a DLL (our `dstorage_loader.dll`, loaded by Go), the Windows DLL search order is different than when code runs inside an EXE. Specifically, `dstorage.dll` internally tries to load `dstoragecore.dll` via `LoadLibrary("dstoragecore.dll")`. For an EXE, Windows searches the EXE's directory. For a DLL loading another DLL, Windows does NOT search the calling DLL's directory — it searches the process EXE's directory (which is Go's temp build directory, where `dstoragecore.dll` does not exist). So `dstoragecore.dll` fails to load, and `dstorage.dll` returns E_NOTIMPL.
+
+**Solution:** Pre-load `dstoragecore.dll` explicitly with its full path BEFORE loading `dstorage.dll`. The code in `EnsureDStorageLoaded()`:
+```cpp
+// CRITICAL: Pre-load dstoragecore.dll BEFORE dstorage.dll
+WCHAR corePath[MAX_PATH];
+wcscpy_s(corePath, dllDir);
+wcscat_s(corePath, L"dstoragecore.dll");
+g_dstorageCoreModule = LoadLibraryW(corePath);
+
+// Now load dstorage.dll — it will find dstoragecore.dll already in the process
+WCHAR dstoragePath[MAX_PATH];
+wcscpy_s(dstoragePath, dllDir);
+wcscat_s(dstoragePath, L"dstorage.dll");
+g_dstorageModule = LoadLibraryW(dstoragePath);
+```
+
+Once `dstoragecore.dll` is already loaded in the process, `dstorage.dll` finds it via `GetModuleHandle` and everything works.
+
+### Bug 3: dstorage.lib Still in Linker Args (MINOR, RESOLVED)
+
+**Problem:** After switching to dynamic loading of `dstorage.dll`, the `build.ps1` linker step still included `dstorage.lib` and the `$dsLib` path. This caused the DLL to have an import table entry for `dstorage.dll`, which meant Windows tried to load `dstorage.dll` at DLL load time (before our `EnsureDStorageLoaded` code could set up the search path).
+
+**Solution:** Removed `dstorage.lib` and `$dsLib` from the linker arguments in `build.ps1`. Our DLL now has no import table dependency on `dstorage.dll`.
+
+### Bug 4: E_DSTORAGE_REQUEST_TOO_LARGE (0x89240008) for >32MB reads (KNOWN LIMITATION)
+
+**Problem:** DirectStorage requests fail with `0x89240008` when the request size exceeds 32MB (33,554,432 bytes). Tested: 32MB works, 33MB fails.
+
+**Status:** Known limitation. Not yet fixed. The `DSTORAGE_REQUEST` struct uses `uint32_t` for size fields, so the theoretical max is 4GB, but DirectStorage enforces a 32MB per-request limit internally.
+
+**Workaround for future:** Split large reads into multiple 32MB (or smaller) requests, enqueue them all, then submit once. This can be done in the C API or the Go layer. For GGUF tensor loading, individual tensors are typically well under 32MB, so this is not an immediate blocker.
+
+---
+
+## 10. BENCHMARK RESULTS
+
+### Test 1: Synthetic Files (from `go test -v`)
+
+These tests use randomly generated temporary files (NOT cached in OS page cache):
+
+| Transfer | Size | Avg Time | Throughput |
+|----------|------|----------|------------|
+| SSD -> GPU | 64KB | 4.5ms | 13.8 MB/s |
+| SSD -> GPU | 1MB | 4.0ms | 250.1 MB/s |
+| SSD -> GPU | 16MB | 9.1ms | 1,758.2 MB/s |
+| SSD -> CPU | 64KB | 2.2ms | 28.6 MB/s |
+| SSD -> CPU | 1MB | 3.9ms | 256.7 MB/s |
+| SSD -> CPU | 16MB | 10.4ms | 1,541.2 MB/s |
+
+### Test 2: Real Model File (deepseek-r1:7b, 4.4GB GGUF)
+
+**File:** `C:\Users\danie\.ollama\models\blobs\sha256-96c415656d377afbff962f6cdb2394ab092ccbcbaab4b82525bc4ca800fe8a49`
+
+Standard I/O reads from OS page cache (file already in RAM). DirectStorage bypasses the cache and reads from SSD.
+
+| Size | Std I/O (cached) | DS -> CPU (SSD) | DS -> GPU (SSD) |
+|------|:-:|:-:|:-:|
+| 64KB | 228 MB/s | 14 MB/s | 38 MB/s |
+| 256KB | 996 MB/s | 288 MB/s | 207 MB/s |
+| 1MB | 2,854 MB/s | 1,027 MB/s | 580 MB/s |
+| 4MB | 3,205 MB/s | 1,930 MB/s | 1,054 MB/s |
+| 16MB | 2,624 MB/s | 2,434 MB/s | 2,184 MB/s |
+| 32MB | N/A | (limit) | (limit) |
+| 64MB+ | N/A | FAILS | FAILS |
+
+**Data verification:** 1MB of the model file was read via standard I/O, DirectStorage-to-CPU, and DirectStorage-to-GPU-to-CPU roundtrip. All three produced identical bytes.
+
+### Analysis
+
+1. Standard I/O appears faster because it reads from the OS page cache (RAM), not from SSD. DirectStorage always reads from SSD (bypasses the cache).
+2. DirectStorage has a fixed per-request overhead of approximately 1-5ms. This makes small reads (<256KB) very inefficient. Reads should be batched at 4MB+ for good throughput.
+3. At 16MB, DirectStorage SSD-to-GPU achieves ~2.2 GB/s, which approaches the raw NVMe sequential read speed of 1.6 GB/s. The apparent >1.6 GB/s throughput may be due to NVMe command queuing and SSD caching.
+4. The real advantage of DirectStorage is not speed over cached I/O. It is that the data goes directly to GPU VRAM without ever touching system RAM. For a 70B model where system RAM cannot hold the entire model, this is the only path that works.
+
+---
+
+## 11. OLLAMA INSTALLATION AND MODEL FILES
+
+### Ollama Binary Installation
+- **Version:** 0.15.4
+- **Install location:** `C:\Users\danie\AppData\Local\Programs\Ollama\`
+  - `ollama.exe` (34.9 MB) — CLI
+  - `ollama app.exe` (25.5 MB) — GUI/tray application
+
+### Ollama Runtime Libraries
+- **Location:** `C:\Users\danie\AppData\Local\Programs\Ollama\lib\ollama\`
+- `ggml-base.dll` — Base GGML library
+- `ggml-cpu-*.dll` — 7 CPU backend variants (sse42, x64, sandybridge, haswell, alderlake, skylakex, icelake)
+- `cuda_v12/ggml-cuda.dll` + CUDA 12 runtime DLLs (cublas, cublasLt, cudart)
+- `cuda_v13/ggml-cuda.dll` + CUDA 13 runtime DLLs (cublas, cublasLt)
+- `vulkan/` — Vulkan backend
+- `rocm/` — AMD ROCm backend with rocBLAS kernels
+
+Since the system has CUDA 13.0, Ollama uses `cuda_v13/ggml-cuda.dll`.
+
+### Ollama Source Code
+- **Location:** `C:\Users\danie\Documents\ollama\`
+- **Go module:** `github.com/ollama/ollama` (go.mod at root, Go 1.24.1)
+- **Key source paths for future integration:**
+  - `ml/backend/ggml/ggml.go` — GGML backend, `Load()` function, `Backend` struct
+  - `ml/backend.go` — Backend interface definition
+  - `ml/device.go` — Device detection and selection
+  - `llm/server.go` — LLM server that loads and runs models
+  - `kvcache/causal.go` — KV cache implementation (relevant for Problem 3)
+
+### Downloaded Models
+
+| Model | ID | Blob Size | Blob Filename (SHA256) |
+|-------|----|-----------|------------------------|
+| codestral:latest | 0898a8b286d5 | 12.6 GB | sha256-22a849aafe3d... |
+| gemma3n:e2b | 719372f8c7de | 5.6 GB | sha256-3839a254cf2d... |
+| deepseek-r1:7b | 755ced02ce7b | 4.7 GB | sha256-96c415656d37... |
+| ALIENTELLIGENCE/psychologist | 808f0b15c923 | 4.7 GB | sha256-6a0746a1ec1a... |
+| mistral:7b-instruct | 6577803aa9a0 | 4.4 GB | sha256-f5074b1221da... |
+| cas/alma-r | ff5076c6bb31 | 4.1 GB | sha256-d0900d04fedc... |
+| gemma3:4b / gemma3:latest | a2af6cc3eb7f | 3.3 GB | sha256-aeda25e63ebd... |
+
+Model blobs are stored at: `C:\Users\danie\.ollama\models\blobs\`
+
+For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
+`C:\Users\danie\.ollama\models\blobs\sha256-96c415656d377afbff962f6cdb2394ab092ccbcbaab4b82525bc4ca800fe8a49`
+
+---
+
+## 12. KNOWN LIMITATIONS
+
+1. ~~32MB per-request limit:~~ **RESOLVED.** `ds_loader_read_chunked()` auto-splits large reads. `LoadBlock()` transparently uses single or chunked path.
+
+2. ~~**No multi-tensor batching:**~~ **RESOLVED.** `RequestLayerTensors()` now opens the file once, enqueues all non-resident tensors, and does a single submit+wait. File handles are cached across calls via `OpenFile`/`CloseFile`.
+
+3. **D3D12 buffer only:** The GPU buffers created by our API are D3D12 committed resources. CUDA/GGML cannot directly use D3D12 resources. For Ollama integration, we would need either:
+   - D3D12-CUDA interop (sharing GPU memory between D3D12 and CUDA)
+   - Or reading to CPU memory via `ReadToMemory` and then uploading to CUDA
+   - Or a CUDA-side approach using cuFile (GPUDirect Storage for Linux, not available on Windows)
+
+4. **Single device:** The loader always uses the default GPU (`D3D12CreateDevice(NULL, ...)`). Multi-GPU is not supported.
+
+5. **No GPU decompression:** DirectStorage supports GPU-based decompression (GDeflate), which could decompress quantized weights on the GPU during transfer. This is not yet implemented.
+
+6. ~~**No file handle caching:**~~ **RESOLVED.** `ds_loader_open_file` caches the `IDStorageFile` handle. Same-file opens are no-ops.
+
+7. **Hardcoded DLL search path:** The Go code has a hardcoded path to `dstorage_loader.dll`. For production, this should be configurable.
+
+8. **LSP errors in IDE:** The IDE (VS Code or similar) shows errors in `.cpp` files because it doesn't have the DirectStorage include path configured. These are not real errors — the code compiles fine with `cl.exe` using the include paths from `build.ps1`.
+
+---
+
+## 13. WHAT WAS COMPLETED
+
+1. **Research and planning** — Identified the five problems, understood the relationship between DirectStorage (runtime residency control) and MoE (model-level sparsity), documented hardware capabilities
+
+2. **DirectStorage C++ implementation** — Complete `dstorage_loader.dll` with 9 exported functions covering availability check, lifecycle management, GPU buffer management, SSD-to-GPU reads, SSD-to-CPU reads, and GPU readback
+
+3. **Critical bug fix** — Solved the `E_NOTIMPL` error by pre-loading `dstoragecore.dll` before `dstorage.dll` to work around Windows DLL search order differences between EXE and DLL contexts
+
+4. **Go bindings** — Complete Go package with Windows implementation and non-Windows stub, no CGO dependency, clean API with proper error handling and HRESULT debugging
+
+5. **Build system** — PowerShell build script that compiles C++, links DLL, builds Go, and runs tests in one command
+
+6. **Test suite** — 15 tests covering availability, lifecycle, data correctness (4KB, 64KB, 1MB, with offset), SSD-to-GPU-to-CPU roundtrips, and throughput benchmarks
+
+7. **Verification against real model file** — Confirmed byte-perfect data transfer for 1MB of the deepseek-r1:7b GGUF blob via both SSD-to-CPU and SSD-to-GPU-to-CPU paths
+
+8. **Throughput benchmarking** — Measured DirectStorage throughput from 64KB to 256MB, found 32MB per-request limit, achieved ~2.2 GB/s at 16MB reads
+
+9. **GGUF parser (gguf/ package)** — Wraps Ollama's existing `fs/ggml.Decode()` to extract tensor metadata with absolute file offsets suitable for DirectStorage reads. Tested against deepseek-r1:7b (qwen2, 7.62B params, 339 tensors, 4.36 GB)
+
+10. **Tensor residency manager (streamer/ package)** — LRU-eviction GPU buffer pool with configurable VRAM budget. Loads tensors on demand from SSD via DirectStorage, evicts least-recently-used tensors when budget exceeded. Tracks hits/misses/evictions with statistics.
+
+11. **Standalone tensor streaming demo (cmd/tensor_demo/)** — End-to-end demo that parses GGUF, prints model info and layer structure, simulates layer-by-layer inference with streaming, demonstrates LRU eviction under memory pressure, runs a cache-hit verification pass, and optionally verifies data integrity via GPU readback. Tested with deepseek-r1:7b:
+    - 512MB budget, 5 layers: 46 tensors loaded at 578 MB/s, second pass all cache hits (0ms), data verified correct
+    - 50MB budget, 10 layers: 181 loads, 151 evictions, proper LRU behavior, second pass correctly re-loads from SSD
+
+12. **Chunked reads for >32MB tensors** — Added `ds_loader_read_chunked()` to the native C++ layer. Splits any read into <=32MB DirectStorage requests, enqueues all chunks, submits once, waits once. Go `LoadBlock()` auto-selects single vs chunked path transparently. Results:
+    - `output.weight` (426MB): loaded in 313ms at **1,427 MB/s**
+    - `token_embd.weight` (292MB): loaded in 222ms at **1,381 MB/s**
+    - Full model (339 tensors, 4.36 GB): loaded in **5.6 seconds** at **840 MB/s** average
+    - Zero tensor skips — 100% of tensors can now be loaded regardless of size
+
+13. **File handle caching + request batching** — Added 4 new C++ exports (`ds_loader_open_file`, `ds_loader_close_file`, `ds_loader_enqueue_read`, `ds_loader_submit_and_wait`) and corresponding Go bindings (`OpenFile`, `CloseFile`, `EnqueueRead`, `SubmitAndWait`). `RequestLayerTensors()` in the streamer now uses the batched path: opens the file once, creates all GPU buffers, enqueues all non-resident tensor reads, does a single submit+wait. Results:
+    - Full model (339 tensors, 4.36 GB, 4GB budget): loaded in **4.86 seconds** at **962 MB/s** average (vs 5.6s / 840 MB/s before batching — **14.5% throughput improvement**)
+    - File handle caching eliminates 339 → 1 `IDStorageFactory::OpenFile` calls per layer batch
+    - Fence wait reduction: 339 → 31 submit+wait cycles (28 layers + 3 non-block tensors)
+    - Data verified byte-perfect via GPU readback
+    - Second pass: 336/336 cache hits, 0ms
+    - Tight budget (200MB, 10 layers): 108 evictions, correct LRU behavior, all tensors loaded successfully
+
+---
+
+## 14. WHAT WAS NOT DONE YET
+
+1. ~~Chunked reads for >32MB~~ — **DONE.** `ds_loader_read_chunked()` splits large reads into <=32MB chunks, enqueues all, submits once. `LoadBlock()` auto-selects single vs chunked path. Tested: `output.weight` (426MB) at 1,427 MB/s, `token_embd.weight` (292MB) at 1,381 MB/s. Full 4.36GB model loads in 5.6 seconds.
+
+2. ~~**File handle caching**~~ — **DONE.** `ds_loader_open_file` caches `IDStorageFile` handles; `ds_loader_enqueue_read` uses them for batch enqueuing; `ds_loader_submit_and_wait` submits once. Full model loads 14.5% faster.
+
+3. ~~**Request batching**~~ — **DONE.** `RequestLayerTensors()` now batches all non-resident tensor reads into a single submit+wait cycle.
+
+4. **D3D12-CUDA interop** — No code to share D3D12 GPU buffers with CUDA. This is required for GGML/Ollama to compute on the loaded data. The GPU buffers created by DirectStorage are D3D12 resources; CUDA cannot read them without explicit interop.
+
+5. **Ollama integration** — No modifications to Ollama's model loading code. The dstorage package exists in the Ollama source tree but nothing references it.
+
+6. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
+
+7. **GPU decompression** — DirectStorage supports GDeflate decompression on the GPU during transfer. Not implemented.
+
+8. **Prefetching** — The streamer loads tensors reactively (on demand). It could predict which tensors will be needed next (e.g., the next layer's tensors) and prefetch them during computation.
+
+9. **Streamer tests** — No unit tests for the `streamer/` package yet. The demo validates behavior but formal tests are needed.
+
+---
+
+## 15. RECOMMENDED NEXT STEPS
+
+The standalone GGUF tensor streamer is now COMPLETE (see Section 13, items 9-11). The next priorities are:
+
+### ~~Priority 1: Chunked Reads for >32MB Tensors~~ — DONE
+
+Implemented `ds_loader_read_chunked()`. Full model loads in 5.6 seconds. See Section 13, item 12.
+
+### ~~Priority 1 (new): File Handle Caching + Request Batching~~ — DONE
+
+Implemented 4 new C++ exports + Go bindings + streamer integration. Full model loads 14.5% faster (4.86s at 962 MB/s vs 5.6s at 840 MB/s). See Section 13, item 13.
+
+### Priority 1 (new): Prefetching
+
+While one layer is being "processed" (simulated compute), prefetch the next layer's tensors in the background. This overlaps SSD I/O with computation and hides latency.
+
+### Priority 4: D3D12-CUDA Interop
+
+To actually use the loaded data for inference, CUDA must be able to read the D3D12 GPU buffers. Options:
+- `cudaImportExternalMemory()` with `cudaExternalMemoryHandleTypeD3D12Resource`
+- Or read back to CPU and re-upload to CUDA (defeats the purpose of DirectStorage)
+- Or investigate NVIDIA's GPUDirect Storage (for Linux only, may not help on Windows)
+
+This is required before any actual inference integration with Ollama.
+
+### Priority 5: Ollama Integration
+
+Once chunked reads, batching, and D3D12-CUDA interop are working, the streamer can replace Ollama's standard model loading path for models that exceed VRAM. The integration point is `ml/backend/ggml/ggml.go` where `Backend.Load()` loads tensors.
+
+---
+
+## END OF DOCUMENT
+
+This document was last updated on 2026-02-05. All file paths, versions, sizes, and benchmark numbers are from this date. If anything changes (Ollama update, driver update, file moves), update the relevant sections.
+
+### Update Log
+- 2026-02-05: Initial document covering Problem 1 (DirectStorage SSD→GPU streaming) — SOLVED
+- 2026-02-05: Added GGUF parser, tensor streamer with LRU eviction, and standalone demo (Problem 4 partially done)
+- 2026-02-05: Implemented chunked reads — no more 32MB limit. Full 4.36GB model loads in 5.6s at 840 MB/s
+- 2026-02-05: Implemented file handle caching + request batching — 4 new C++ exports, Go bindings, streamer batched path. Full model loads in 4.86s at 962 MB/s (14.5% improvement). DLL now exports 14 functions.

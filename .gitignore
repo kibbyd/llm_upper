@@ -1,0 +1,29 @@
+# Build artifacts
+*.dll
+*.obj
+*.lib
+*.exp
+*.exe
+*.pdb
+
+# Build logs
+*_stdout.txt
+*_stderr.txt
+link_stdout.txt
+link_stderr.txt
+build_stdout.txt
+build_stderr.txt
+
+# Windows artifacts
+nul
+Thumbs.db
+desktop.ini
+
+# IDE
+.vs/
+.vscode/
+*.suo
+*.user
+
+# Go
+*.test
