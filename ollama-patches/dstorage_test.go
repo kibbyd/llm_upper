@@ -1054,3 +1054,193 @@ func TestVMMReserveMapUnmap(t *testing.T) {
 
 	t.Log("VMM reserve/map/unmap/remap cycle: SUCCESS")
 }
+
+// ============================================================
+// Expert Pool tests
+// ============================================================
+
+func TestExpertPool_Create(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+	if !VMMAvailable() {
+		t.Skip("VMM not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	// Create a small expert pool for testing
+	// 16 experts, 4 MB each (will round to 4 MB due to 2 MB granularity)
+	// Physical pool: 16 MB (can hold 4 experts)
+	expertSize := uint64(4 * 1024 * 1024) // 4 MB
+	totalExperts := uint32(16)
+	physPoolSize := uint64(16 * 1024 * 1024) // 16 MB
+
+	pool, err := NewExpertPool(loader, expertSize, totalExperts, physPoolSize)
+	if err != nil {
+		t.Fatalf("Failed to create expert pool: %v (HRESULT=0x%08X)", err, uint32(GetLastHResult()))
+	}
+	defer pool.Close()
+
+	info := pool.GetInfo()
+	t.Logf("Expert pool created:")
+	t.Logf("  VA size: %d MB", info.VASize/1024/1024)
+	t.Logf("  Phys size: %d MB", info.PhysSize/1024/1024)
+	t.Logf("  Expert size: %d MB", info.ExpertSize/1024/1024)
+	t.Logf("  Total experts: %d", info.TotalExperts)
+	t.Logf("  Resident experts: %d", info.ResidentExperts)
+
+	if info.TotalExperts != totalExperts {
+		t.Errorf("Expected %d total experts, got %d", totalExperts, info.TotalExperts)
+	}
+	if info.ResidentExperts != 0 {
+		t.Errorf("Expected 0 resident experts initially, got %d", info.ResidentExperts)
+	}
+	// VA size should be expertSize * totalExperts
+	expectedVA := info.ExpertSize * uint64(totalExperts)
+	if info.VASize != expectedVA {
+		t.Errorf("Expected VA size %d, got %d", expectedVA, info.VASize)
+	}
+}
+
+func TestExpertPool_LoadAndEvict(t *testing.T) {
+	if !IsAvailable() {
+		t.Skip("DirectStorage not available")
+	}
+	if !IsCudaAvailable() {
+		t.Skip("CUDA not available")
+	}
+	if !VMMAvailable() {
+		t.Skip("VMM not available")
+	}
+
+	loader, err := NewLoader(0)
+	if err != nil {
+		t.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+
+	// Create test file with expert data
+	totalExperts := uint32(8)
+	expertDataSize := uint64(1024 * 1024) // 1 MB of actual data per expert
+	totalFileSize := int(expertDataSize) * int(totalExperts)
+	path, testData := createTestFile(t, totalFileSize)
+
+	// Expert size rounds up to 2 MB (VMM granularity)
+	// Physical pool: 4 MB (can hold 2 experts at a time)
+	expertSize := uint64(2 * 1024 * 1024)   // 2 MB (granularity)
+	physPoolSize := uint64(4 * 1024 * 1024) // 4 MB (2 experts)
+
+	pool, err := NewExpertPool(loader, expertSize, totalExperts, physPoolSize)
+	if err != nil {
+		t.Fatalf("Failed to create expert pool: %v", err)
+	}
+	defer pool.Close()
+
+	// Set model path
+	err = pool.SetModelPath(path)
+	if err != nil {
+		t.Fatalf("Failed to set model path: %v", err)
+	}
+
+	// Set file info for each expert
+	for i := uint32(0); i < totalExperts; i++ {
+		offset := uint64(i) * expertDataSize
+		err = pool.SetFileInfo(i, offset, expertDataSize)
+		if err != nil {
+			t.Fatalf("Failed to set file info for expert %d: %v", i, err)
+		}
+	}
+
+	info := pool.GetInfo()
+	t.Logf("Pool: %d total experts, %d MB phys pool (%d expert slots)",
+		info.TotalExperts, info.PhysSize/1024/1024, info.PhysSize/info.ExpertSize)
+
+	// Load experts 0 and 1 — should fit in pool
+	err = pool.EnsureLoaded([]uint32{0, 1})
+	if err != nil {
+		t.Fatalf("Failed to load experts 0,1: %v", err)
+	}
+
+	stats := pool.GetStats()
+	info = pool.GetInfo()
+	t.Logf("After loading 0,1: resident=%d, misses=%d, hits=%d",
+		info.ResidentExperts, stats.Misses, stats.Hits)
+
+	if info.ResidentExperts != 2 {
+		t.Errorf("Expected 2 resident experts, got %d", info.ResidentExperts)
+	}
+	if stats.Misses != 2 {
+		t.Errorf("Expected 2 misses (first load), got %d", stats.Misses)
+	}
+
+	// Request same experts again — should be hits
+	err = pool.EnsureLoaded([]uint32{0, 1})
+	if err != nil {
+		t.Fatalf("Failed to re-load experts 0,1: %v", err)
+	}
+
+	stats = pool.GetStats()
+	t.Logf("After re-loading 0,1: misses=%d, hits=%d", stats.Misses, stats.Hits)
+	if stats.Hits != 2 {
+		t.Errorf("Expected 2 hits (re-request), got %d", stats.Hits)
+	}
+
+	// Load experts 2 and 3 — should evict 0 and 1 (LRU)
+	err = pool.EnsureLoaded([]uint32{2, 3})
+	if err != nil {
+		t.Fatalf("Failed to load experts 2,3: %v", err)
+	}
+
+	stats = pool.GetStats()
+	info = pool.GetInfo()
+	t.Logf("After loading 2,3: resident=%d, misses=%d, evictions=%d",
+		info.ResidentExperts, stats.Misses, stats.Evictions)
+
+	if info.ResidentExperts != 2 {
+		t.Errorf("Expected 2 resident experts (pool size), got %d", info.ResidentExperts)
+	}
+	if stats.Evictions != 2 {
+		t.Errorf("Expected 2 evictions, got %d", stats.Evictions)
+	}
+
+	// Verify expert 2's data by getting its pointer and reading back
+	ptr2 := pool.GetPtr(2)
+	if ptr2 == 0 {
+		t.Fatal("Expert 2 pointer is 0 — not resident")
+	}
+	t.Logf("Expert 2 CUDA ptr: 0x%X", ptr2)
+
+	// Read back and verify
+	readback := make([]byte, expertDataSize)
+	err = CudaDtoH(ptr2, readback)
+	if err != nil {
+		t.Fatalf("CudaDtoH failed: %v", err)
+	}
+
+	// Check against expected data
+	expectedOffset := 2 * int(expertDataSize)
+	expected := testData[expectedOffset : expectedOffset+int(expertDataSize)]
+	if !bytes.Equal(expected, readback) {
+		t.Error("Expert 2 data mismatch!")
+	} else {
+		t.Log("Expert 2 data verified correct!")
+	}
+
+	// Expert 0 should no longer be resident
+	ptr0 := pool.GetPtr(0)
+	if ptr0 != 0 {
+		t.Errorf("Expert 0 should have been evicted, but got ptr 0x%X", ptr0)
+	}
+
+	t.Logf("Final stats: hits=%d, misses=%d, evictions=%d, streamed=%d MB",
+		stats.Hits, stats.Misses, stats.Evictions, stats.BytesStreamed/1024/1024)
+	t.Log("Expert pool load/evict test: SUCCESS")
+}

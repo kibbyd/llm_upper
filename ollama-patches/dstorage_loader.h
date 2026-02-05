@@ -258,6 +258,93 @@ DS_API int ds_loader_vmm_map(
 // Returns 0 on success, -1 on failure.
 DS_API int ds_loader_vmm_unmap(uint64_t va_ptr, uint64_t size);
 
+// ============================================================
+// Expert Pool for MoE Expert Streaming
+// ============================================================
+// High-level API for managing MoE expert weights with VRAM overcommit.
+// Combines VMM (virtual address reservation, physical memory pool) with
+// DirectStorage (streaming from SSD) and LRU eviction.
+//
+// Typical usage:
+//   1. Create pool with total expert count and physical memory budget
+//   2. Register file offsets for each expert
+//   3. Before each token, call ensure_loaded() with active expert indices
+//   4. Get CUDA pointers for loaded experts and run inference
+//   5. Destroy pool when done
+
+typedef struct ExpertPool* ExpertPoolHandle;
+
+// Create an expert pool for MoE weight streaming.
+// loader: DirectStorage loader (for streaming data from SSD)
+// expertSize: bytes per expert (will be rounded up to VMM granularity)
+// totalExperts: total number of experts (layers × experts_per_layer)
+// physPoolSize: physical VRAM budget for expert data (will be rounded to granularity)
+// Returns pool handle, or NULL on failure.
+DS_API ExpertPoolHandle ds_loader_expert_pool_create(
+    DSLoaderHandle loader,
+    uint64_t expertSize,
+    uint32_t totalExperts,
+    uint64_t physPoolSize
+);
+
+// Destroy expert pool, releasing all VA and physical memory.
+DS_API void ds_loader_expert_pool_destroy(ExpertPoolHandle pool);
+
+// Set file location for an expert's data.
+// expertIdx: expert index (0 to totalExperts-1)
+// fileOffset: byte offset in the model file
+// fileSize: actual data size (may be less than expertSize)
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_expert_set_file_info(
+    ExpertPoolHandle pool,
+    uint32_t expertIdx,
+    uint64_t fileOffset,
+    uint64_t fileSize
+);
+
+// Set the model file path for streaming experts.
+// Returns 0 on success, -1 on failure.
+DS_API int ds_loader_expert_set_model_path(
+    ExpertPoolHandle pool,
+    const wchar_t* modelPath
+);
+
+// Ensure specified experts are resident in memory.
+// Loads from SSD if not resident, evicts LRU experts if physical pool is full.
+// expertIdxs: array of expert indices to ensure loaded
+// count: number of experts in the array
+// Returns 0 on success (all experts now resident), -1 on failure.
+DS_API int ds_loader_expert_ensure_loaded(
+    ExpertPoolHandle pool,
+    const uint32_t* expertIdxs,
+    uint32_t count
+);
+
+// Get CUDA device pointer for a specific expert.
+// The expert MUST have been loaded via ensure_loaded first.
+// Returns CUdeviceptr (as uint64) or 0 if not resident.
+DS_API uint64_t ds_loader_expert_get_ptr(ExpertPoolHandle pool, uint32_t expertIdx);
+
+// Get pool statistics.
+// All output parameters are optional (pass NULL to skip).
+DS_API void ds_loader_expert_get_stats(
+    ExpertPoolHandle pool,
+    uint64_t* outHits,
+    uint64_t* outMisses,
+    uint64_t* outEvictions,
+    uint64_t* outBytesStreamed
+);
+
+// Get pool configuration info.
+DS_API void ds_loader_expert_get_info(
+    ExpertPoolHandle pool,
+    uint64_t* outVASize,           // Total VA space reserved
+    uint64_t* outPhysSize,         // Physical memory pool size
+    uint64_t* outExpertSize,       // Size per expert (aligned)
+    uint32_t* outTotalExperts,     // Total expert count
+    uint32_t* outResidentExperts   // Currently resident expert count
+);
+
 #ifdef __cplusplus
 }
 #endif

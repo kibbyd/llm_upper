@@ -12,6 +12,8 @@
 #include <wrl/client.h>
 #include <string>
 #include <unordered_map>
+#include <vector>
+#include <list>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -1448,6 +1450,440 @@ void ds_loader_cuda_destroy(CUDAInteropHandle interop) {
     delete interop;
 }
 
+} // End extern "C" for struct definitions
+
+// ============================================================
+// Expert Pool for MoE Expert Streaming
+// ============================================================
+// C++ structs (must be outside extern "C" because they use STL)
+
+struct ExpertFileInfo {
+    uint64_t fileOffset;
+    uint64_t fileSize;
+};
+
+struct ExpertState {
+    bool resident;                        // Has physical backing
+    int32_t physChunkIdx;                 // Which phys chunk backs this (-1 if not resident)
+    std::list<uint32_t>::iterator lruIter; // Position in LRU list
+    bool inLRU;                           // Is this iterator valid
+};
+
+struct PhysChunk {
+    CUmemGenericAllocationHandle handle;
+    uint64_t size;
+    int32_t mappedExpert;                 // Which expert is using this (-1 if free)
+};
+
+struct ExpertPool {
+    // Virtual address space
+    CUdeviceptr vaBase;
+    uint64_t vaSize;
+    uint64_t expertSize;                  // Per-expert size (aligned to granularity)
+    uint64_t granularity;
+    uint32_t totalExperts;
+    
+    // Physical memory pool
+    std::vector<PhysChunk> physPool;
+    uint64_t physTotal;
+    uint32_t physCount;                   // Number of physical chunks
+    
+    // Expert tracking
+    std::vector<ExpertState> experts;
+    std::vector<ExpertFileInfo> fileInfo;
+    
+    // LRU list: front = least recently used, back = most recently used
+    std::list<uint32_t> lruList;
+    
+    // DirectStorage loader and model path
+    DSLoader* dsLoader;
+    std::wstring modelPath;
+    
+    // Statistics
+    uint64_t hits;
+    uint64_t misses;
+    uint64_t evictions;
+    uint64_t bytesStreamed;
+};
+
+// Internal helper functions (outside extern "C")
+static int EvictExpert(ExpertPool* pool, uint32_t expertIdx);
+static int32_t AcquirePhysChunk(ExpertPool* pool);
+static int LoadExpertData(ExpertPool* pool, uint32_t expertIdx, CUdeviceptr destVA);
+
+extern "C" {
+
+ExpertPoolHandle ds_loader_expert_pool_create(
+    DSLoaderHandle loader,
+    uint64_t expertSize,
+    uint32_t totalExperts,
+    uint64_t physPoolSize
+) {
+    if (!loader || !EnsureCudaLoaded() || !g_vmmAvailable) {
+        g_lastHR = E_INVALIDARG;
+        return nullptr;
+    }
+    
+    // Get granularity
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = g_cudaDevice;
+    
+    size_t granularity = 0;
+    CUresult cr = g_cuMemGetAllocationGranularity(&granularity, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (cr != CUDA_SUCCESS || granularity == 0) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return nullptr;
+    }
+    
+    // Round expert size up to granularity
+    uint64_t alignedExpertSize = ((expertSize + granularity - 1) / granularity) * granularity;
+    
+    // Calculate total VA space needed
+    uint64_t vaSize = alignedExpertSize * totalExperts;
+    
+    // Round phys pool size down to granularity (each chunk = 1 expert)
+    uint64_t alignedPhysPool = (physPoolSize / alignedExpertSize) * alignedExpertSize;
+    if (alignedPhysPool < alignedExpertSize) {
+        // Need at least one physical chunk
+        g_lastHR = E_INVALIDARG;
+        return nullptr;
+    }
+    uint32_t physCount = (uint32_t)(alignedPhysPool / alignedExpertSize);
+    
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    // Reserve VA space for all experts
+    CUdeviceptr vaBase = 0;
+    cr = g_cuMemAddressReserve(&vaBase, (size_t)vaSize, (size_t)granularity, 0, 0);
+    if (cr != CUDA_SUCCESS || vaBase == 0) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return nullptr;
+    }
+    
+    // Create pool structure
+    ExpertPool* pool = new (std::nothrow) ExpertPool();
+    if (!pool) {
+        g_cuMemAddressFree(vaBase, vaSize);
+        g_lastHR = E_OUTOFMEMORY;
+        return nullptr;
+    }
+    
+    pool->vaBase = vaBase;
+    pool->vaSize = vaSize;
+    pool->expertSize = alignedExpertSize;
+    pool->granularity = granularity;
+    pool->totalExperts = totalExperts;
+    pool->physTotal = alignedPhysPool;
+    pool->physCount = physCount;
+    pool->dsLoader = (DSLoader*)loader;
+    pool->hits = 0;
+    pool->misses = 0;
+    pool->evictions = 0;
+    pool->bytesStreamed = 0;
+    
+    // Initialize expert states
+    pool->experts.resize(totalExperts);
+    pool->fileInfo.resize(totalExperts);
+    for (uint32_t i = 0; i < totalExperts; i++) {
+        pool->experts[i].resident = false;
+        pool->experts[i].physChunkIdx = -1;
+        pool->experts[i].inLRU = false;
+        pool->fileInfo[i].fileOffset = 0;
+        pool->fileInfo[i].fileSize = 0;
+    }
+    
+    // Create physical memory chunks
+    pool->physPool.resize(physCount);
+    for (uint32_t i = 0; i < physCount; i++) {
+        CUmemGenericAllocationHandle handle = 0;
+        cr = g_cuMemCreate(&handle, (size_t)alignedExpertSize, &prop, 0);
+        if (cr != CUDA_SUCCESS) {
+            // Cleanup already created chunks
+            for (uint32_t j = 0; j < i; j++) {
+                g_cuMemRelease(pool->physPool[j].handle);
+            }
+            g_cuMemAddressFree(vaBase, vaSize);
+            delete pool;
+            g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+            return nullptr;
+        }
+        pool->physPool[i].handle = handle;
+        pool->physPool[i].size = alignedExpertSize;
+        pool->physPool[i].mappedExpert = -1;
+    }
+    
+    return pool;
+}
+
+void ds_loader_expert_pool_destroy(ExpertPoolHandle pool) {
+    if (!pool) return;
+    
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    // Unmap all mapped experts
+    for (uint32_t i = 0; i < pool->totalExperts; i++) {
+        if (pool->experts[i].resident) {
+            CUdeviceptr expertVA = pool->vaBase + (uint64_t)i * pool->expertSize;
+            g_cuMemUnmap(expertVA, pool->expertSize);
+        }
+    }
+    
+    // Release physical allocations
+    for (auto& chunk : pool->physPool) {
+        g_cuMemRelease(chunk.handle);
+    }
+    
+    // Free VA space
+    g_cuMemAddressFree(pool->vaBase, pool->vaSize);
+    
+    delete pool;
+}
+
+int ds_loader_expert_set_file_info(
+    ExpertPoolHandle pool,
+    uint32_t expertIdx,
+    uint64_t fileOffset,
+    uint64_t fileSize
+) {
+    if (!pool || expertIdx >= pool->totalExperts) {
+        g_lastHR = E_INVALIDARG;
+        return -1;
+    }
+    pool->fileInfo[expertIdx].fileOffset = fileOffset;
+    pool->fileInfo[expertIdx].fileSize = fileSize;
+    return 0;
+}
+
+int ds_loader_expert_set_model_path(ExpertPoolHandle pool, const wchar_t* modelPath) {
+    if (!pool || !modelPath) {
+        g_lastHR = E_INVALIDARG;
+        return -1;
+    }
+    pool->modelPath = modelPath;
+    return 0;
+}
+
+} // end extern "C" for helper function definitions
+
+// Internal helper functions (use C++ features, must be outside extern "C")
+
+// Internal: evict an expert to free a physical chunk
+static int EvictExpert(ExpertPool* pool, uint32_t expertIdx) {
+    ExpertState& state = pool->experts[expertIdx];
+    if (!state.resident) return 0;  // Nothing to evict
+    
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    // Unmap from VA
+    CUdeviceptr expertVA = pool->vaBase + (uint64_t)expertIdx * pool->expertSize;
+    CUresult cr = g_cuMemUnmap(expertVA, pool->expertSize);
+    if (cr != CUDA_SUCCESS) {
+        g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+        return -1;
+    }
+    
+    // Mark physical chunk as free
+    if (state.physChunkIdx >= 0 && state.physChunkIdx < (int32_t)pool->physPool.size()) {
+        pool->physPool[state.physChunkIdx].mappedExpert = -1;
+    }
+    
+    // Update expert state
+    state.resident = false;
+    state.physChunkIdx = -1;
+    
+    // Remove from LRU
+    if (state.inLRU) {
+        pool->lruList.erase(state.lruIter);
+        state.inLRU = false;
+    }
+    
+    pool->evictions++;
+    return 0;
+}
+
+// Internal: find a free physical chunk, evicting LRU if needed
+static int32_t AcquirePhysChunk(ExpertPool* pool) {
+    // Look for a free chunk
+    for (uint32_t i = 0; i < pool->physCount; i++) {
+        if (pool->physPool[i].mappedExpert == -1) {
+            return (int32_t)i;
+        }
+    }
+    
+    // No free chunk — evict LRU expert
+    if (pool->lruList.empty()) {
+        return -1;  // Shouldn't happen if physCount > 0
+    }
+    
+    uint32_t victimIdx = pool->lruList.front();
+    int32_t chunkIdx = pool->experts[victimIdx].physChunkIdx;
+    
+    if (EvictExpert(pool, victimIdx) != 0) {
+        return -1;
+    }
+    
+    return chunkIdx;
+}
+
+// Internal: load expert data from SSD
+static int LoadExpertData(ExpertPool* pool, uint32_t expertIdx, CUdeviceptr destVA) {
+    const ExpertFileInfo& info = pool->fileInfo[expertIdx];
+    if (info.fileSize == 0 || pool->modelPath.empty()) {
+        g_lastHR = E_INVALIDARG;
+        return -1;
+    }
+    
+    // Use StreamToCuda to load data (SSD -> staging -> cuMemcpyDtoD -> destVA)
+    int result = ds_loader_stream_to_cuda(
+        pool->dsLoader,
+        pool->modelPath.c_str(),
+        info.fileOffset,
+        info.fileSize,
+        destVA
+    );
+    
+    if (result == 0) {
+        pool->bytesStreamed += info.fileSize;
+    }
+    
+    return result;
+}
+
+extern "C" {
+
+int ds_loader_expert_ensure_loaded(
+    ExpertPoolHandle pool,
+    const uint32_t* expertIdxs,
+    uint32_t count
+) {
+    if (!pool || !expertIdxs || count == 0) {
+        g_lastHR = E_INVALIDARG;
+        return -1;
+    }
+    
+    g_cuCtxSetCurrent(g_cudaContext);
+    
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t expertIdx = expertIdxs[i];
+        if (expertIdx >= pool->totalExperts) {
+            g_lastHR = E_INVALIDARG;
+            return -1;
+        }
+        
+        ExpertState& state = pool->experts[expertIdx];
+        
+        if (state.resident) {
+            // Already loaded — update LRU (move to back)
+            pool->hits++;
+            if (state.inLRU) {
+                pool->lruList.erase(state.lruIter);
+            }
+            pool->lruList.push_back(expertIdx);
+            state.lruIter = std::prev(pool->lruList.end());
+            state.inLRU = true;
+            continue;
+        }
+        
+        // Need to load this expert
+        pool->misses++;
+        
+        // Acquire a physical chunk (may evict LRU)
+        int32_t chunkIdx = AcquirePhysChunk(pool);
+        if (chunkIdx < 0) {
+            g_lastHR = E_OUTOFMEMORY;
+            return -1;
+        }
+        
+        // Calculate VA for this expert
+        CUdeviceptr expertVA = pool->vaBase + (uint64_t)expertIdx * pool->expertSize;
+        
+        // Map physical chunk to VA
+        CUresult cr = g_cuMemMap(expertVA, pool->expertSize, 0, 
+                                  pool->physPool[chunkIdx].handle, 0);
+        if (cr != CUDA_SUCCESS) {
+            g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+            return -1;
+        }
+        
+        // Set access permissions
+        CUmemAccessDesc accessDesc = {};
+        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        accessDesc.location.id = g_cudaDevice;
+        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        
+        cr = g_cuMemSetAccess(expertVA, pool->expertSize, &accessDesc, 1);
+        if (cr != CUDA_SUCCESS) {
+            g_cuMemUnmap(expertVA, pool->expertSize);
+            g_lastHR = (HRESULT)(0xCE000000 | (cr & 0xFFFF));
+            return -1;
+        }
+        
+        // Load data from SSD
+        if (LoadExpertData(pool, expertIdx, expertVA) != 0) {
+            g_cuMemUnmap(expertVA, pool->expertSize);
+            return -1;
+        }
+        
+        // Update tracking
+        pool->physPool[chunkIdx].mappedExpert = (int32_t)expertIdx;
+        state.resident = true;
+        state.physChunkIdx = chunkIdx;
+        pool->lruList.push_back(expertIdx);
+        state.lruIter = std::prev(pool->lruList.end());
+        state.inLRU = true;
+    }
+    
+    return 0;
+}
+
+uint64_t ds_loader_expert_get_ptr(ExpertPoolHandle pool, uint32_t expertIdx) {
+    if (!pool || expertIdx >= pool->totalExperts) {
+        return 0;
+    }
+    if (!pool->experts[expertIdx].resident) {
+        return 0;
+    }
+    return pool->vaBase + (uint64_t)expertIdx * pool->expertSize;
+}
+
+void ds_loader_expert_get_stats(
+    ExpertPoolHandle pool,
+    uint64_t* outHits,
+    uint64_t* outMisses,
+    uint64_t* outEvictions,
+    uint64_t* outBytesStreamed
+) {
+    if (!pool) return;
+    if (outHits) *outHits = pool->hits;
+    if (outMisses) *outMisses = pool->misses;
+    if (outEvictions) *outEvictions = pool->evictions;
+    if (outBytesStreamed) *outBytesStreamed = pool->bytesStreamed;
+}
+
+void ds_loader_expert_get_info(
+    ExpertPoolHandle pool,
+    uint64_t* outVASize,
+    uint64_t* outPhysSize,
+    uint64_t* outExpertSize,
+    uint32_t* outTotalExperts,
+    uint32_t* outResidentExperts
+) {
+    if (!pool) return;
+    if (outVASize) *outVASize = pool->vaSize;
+    if (outPhysSize) *outPhysSize = pool->physTotal;
+    if (outExpertSize) *outExpertSize = pool->expertSize;
+    if (outTotalExperts) *outTotalExperts = pool->totalExperts;
+    if (outResidentExperts) {
+        uint32_t count = 0;
+        for (const auto& e : pool->experts) {
+            if (e.resident) count++;
+        }
+        *outResidentExperts = count;
+    }
+}
+
 // ============================================================
 // CUDA Virtual Memory Management (VMM) for MoE expert streaming
 // ============================================================
@@ -1626,6 +2062,20 @@ uint64_t ds_loader_vmm_create_physical(uint64_t size) { return 0; }
 int ds_loader_vmm_release_physical(uint64_t phys_handle) { return -1; }
 int ds_loader_vmm_map(uint64_t va_ptr, uint64_t size, uint64_t phys_handle, uint64_t offset) { return -1; }
 int ds_loader_vmm_unmap(uint64_t va_ptr, uint64_t size) { return -1; }
+
+// Expert Pool stubs
+ExpertPoolHandle ds_loader_expert_pool_create(DSLoaderHandle loader, uint64_t expertSize,
+                                               uint32_t totalExperts, uint64_t physPoolSize) { return NULL; }
+void ds_loader_expert_pool_destroy(ExpertPoolHandle pool) {}
+int ds_loader_expert_set_file_info(ExpertPoolHandle pool, uint32_t expertIdx,
+                                    uint64_t fileOffset, uint64_t fileSize) { return -1; }
+int ds_loader_expert_set_model_path(ExpertPoolHandle pool, const wchar_t* modelPath) { return -1; }
+int ds_loader_expert_ensure_loaded(ExpertPoolHandle pool, const uint32_t* expertIdxs, uint32_t count) { return -1; }
+uint64_t ds_loader_expert_get_ptr(ExpertPoolHandle pool, uint32_t expertIdx) { return 0; }
+void ds_loader_expert_get_stats(ExpertPoolHandle pool, uint64_t* outHits, uint64_t* outMisses,
+                                 uint64_t* outEvictions, uint64_t* outBytesStreamed) {}
+void ds_loader_expert_get_info(ExpertPoolHandle pool, uint64_t* outVASize, uint64_t* outPhysSize,
+                                uint64_t* outExpertSize, uint32_t* outTotalExperts, uint32_t* outResidentExperts) {}
 
 } // extern "C"
 

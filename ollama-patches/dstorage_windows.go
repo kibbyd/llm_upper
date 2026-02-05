@@ -70,6 +70,15 @@ var (
 	procVMMReleasePhysical *syscall.Proc
 	procVMMMap             *syscall.Proc
 	procVMMUnmap           *syscall.Proc
+	// Expert Pool procs (MoE expert streaming)
+	procExpertPoolCreate   *syscall.Proc
+	procExpertPoolDestroy  *syscall.Proc
+	procExpertSetFileInfo  *syscall.Proc
+	procExpertSetModelPath *syscall.Proc
+	procExpertEnsureLoaded *syscall.Proc
+	procExpertGetPtr       *syscall.Proc
+	procExpertGetStats     *syscall.Proc
+	procExpertGetInfo      *syscall.Proc
 	dllLoaded              bool
 	dllLoadAttempted       bool
 )
@@ -147,6 +156,15 @@ func loadDLL() error {
 		{"ds_loader_vmm_release_physical", &procVMMReleasePhysical},
 		{"ds_loader_vmm_map", &procVMMMap},
 		{"ds_loader_vmm_unmap", &procVMMUnmap},
+		// Expert Pool functions
+		{"ds_loader_expert_pool_create", &procExpertPoolCreate},
+		{"ds_loader_expert_pool_destroy", &procExpertPoolDestroy},
+		{"ds_loader_expert_set_file_info", &procExpertSetFileInfo},
+		{"ds_loader_expert_set_model_path", &procExpertSetModelPath},
+		{"ds_loader_expert_ensure_loaded", &procExpertEnsureLoaded},
+		{"ds_loader_expert_get_ptr", &procExpertGetPtr},
+		{"ds_loader_expert_get_stats", &procExpertGetStats},
+		{"ds_loader_expert_get_info", &procExpertGetInfo},
 	}
 
 	for _, p := range procs {
@@ -832,4 +850,172 @@ func VMMUnmap(vaPtr, size uint64) error {
 		return fmt.Errorf("VMM unmap failed: HRESULT=0x%08X", uint32(GetLastHResult()))
 	}
 	return nil
+}
+
+// ============================================================
+// Expert Pool for MoE Expert Streaming
+// ============================================================
+// High-level API for managing MoE expert weights with VRAM overcommit.
+// Combines VMM, DirectStorage, and LRU eviction.
+
+// ExpertPool manages MoE expert weights with virtual memory overcommit.
+// It reserves VA space for all experts but only backs active experts with
+// physical memory. LRU eviction makes room for new experts when needed.
+type ExpertPool struct {
+	handle uintptr
+}
+
+// ExpertPoolStats contains statistics about expert pool usage.
+type ExpertPoolStats struct {
+	Hits          uint64 // Cache hits (expert was already resident)
+	Misses        uint64 // Cache misses (had to load from SSD)
+	Evictions     uint64 // Number of experts evicted to make room
+	BytesStreamed uint64 // Total bytes streamed from SSD
+}
+
+// ExpertPoolInfo contains configuration info about an expert pool.
+type ExpertPoolInfo struct {
+	VASize          uint64 // Total virtual address space reserved
+	PhysSize        uint64 // Physical memory pool size
+	ExpertSize      uint64 // Size per expert (aligned to granularity)
+	TotalExperts    uint32 // Total expert count
+	ResidentExperts uint32 // Currently resident expert count
+}
+
+// NewExpertPool creates a new expert pool for MoE streaming.
+// loader: DirectStorage loader for streaming from SSD
+// expertSize: bytes per expert (will be rounded up to VMM granularity)
+// totalExperts: total number of experts (layers × experts_per_layer)
+// physPoolSize: physical VRAM budget for expert data
+func NewExpertPool(loader *Loader, expertSize uint64, totalExperts uint32, physPoolSize uint64) (*ExpertPool, error) {
+	if err := loadDLL(); err != nil {
+		return nil, err
+	}
+	if loader == nil || loader.handle == 0 {
+		return nil, ErrInvalidArgument
+	}
+	if !VMMAvailable() {
+		return nil, errors.New("CUDA VMM not available")
+	}
+
+	ret, _, _ := procExpertPoolCreate.Call(
+		loader.handle,
+		uintptr(expertSize),
+		uintptr(totalExperts),
+		uintptr(physPoolSize),
+	)
+	if ret == 0 {
+		return nil, fmt.Errorf("failed to create expert pool: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return &ExpertPool{handle: ret}, nil
+}
+
+// Close destroys the expert pool, releasing all VA and physical memory.
+func (p *ExpertPool) Close() {
+	if p == nil || p.handle == 0 {
+		return
+	}
+	procExpertPoolDestroy.Call(p.handle)
+	p.handle = 0
+}
+
+// SetFileInfo sets the file location for an expert's data.
+// expertIdx: expert index (0 to totalExperts-1)
+// fileOffset: byte offset in the model file
+// fileSize: actual data size (may be less than expertSize)
+func (p *ExpertPool) SetFileInfo(expertIdx uint32, fileOffset, fileSize uint64) error {
+	if p == nil || p.handle == 0 {
+		return ErrInvalidArgument
+	}
+	ret, _, _ := procExpertSetFileInfo.Call(
+		p.handle,
+		uintptr(expertIdx),
+		uintptr(fileOffset),
+		uintptr(fileSize),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("failed to set expert file info: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// SetModelPath sets the model file path for streaming experts.
+func (p *ExpertPool) SetModelPath(path string) error {
+	if p == nil || p.handle == 0 {
+		return ErrInvalidArgument
+	}
+	pathW, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return err
+	}
+	ret, _, _ := procExpertSetModelPath.Call(p.handle, uintptr(unsafe.Pointer(pathW)))
+	if int32(ret) != 0 {
+		return fmt.Errorf("failed to set model path: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// EnsureLoaded ensures the specified experts are resident in memory.
+// If not resident, loads from SSD and potentially evicts LRU experts.
+// expertIdxs: slice of expert indices to ensure loaded
+func (p *ExpertPool) EnsureLoaded(expertIdxs []uint32) error {
+	if p == nil || p.handle == 0 {
+		return ErrInvalidArgument
+	}
+	if len(expertIdxs) == 0 {
+		return nil
+	}
+	ret, _, _ := procExpertEnsureLoaded.Call(
+		p.handle,
+		uintptr(unsafe.Pointer(&expertIdxs[0])),
+		uintptr(len(expertIdxs)),
+	)
+	if int32(ret) != 0 {
+		return fmt.Errorf("failed to ensure experts loaded: HRESULT=0x%08X", uint32(GetLastHResult()))
+	}
+	return nil
+}
+
+// GetPtr returns the CUDA device pointer for a specific expert.
+// The expert MUST have been loaded via EnsureLoaded first.
+// Returns 0 if the expert is not resident.
+func (p *ExpertPool) GetPtr(expertIdx uint32) uint64 {
+	if p == nil || p.handle == 0 {
+		return 0
+	}
+	ret, _, _ := procExpertGetPtr.Call(p.handle, uintptr(expertIdx))
+	return uint64(ret)
+}
+
+// GetStats returns pool statistics.
+func (p *ExpertPool) GetStats() ExpertPoolStats {
+	if p == nil || p.handle == 0 {
+		return ExpertPoolStats{}
+	}
+	var stats ExpertPoolStats
+	procExpertGetStats.Call(
+		p.handle,
+		uintptr(unsafe.Pointer(&stats.Hits)),
+		uintptr(unsafe.Pointer(&stats.Misses)),
+		uintptr(unsafe.Pointer(&stats.Evictions)),
+		uintptr(unsafe.Pointer(&stats.BytesStreamed)),
+	)
+	return stats
+}
+
+// GetInfo returns pool configuration info.
+func (p *ExpertPool) GetInfo() ExpertPoolInfo {
+	if p == nil || p.handle == 0 {
+		return ExpertPoolInfo{}
+	}
+	var info ExpertPoolInfo
+	procExpertGetInfo.Call(
+		p.handle,
+		uintptr(unsafe.Pointer(&info.VASize)),
+		uintptr(unsafe.Pointer(&info.PhysSize)),
+		uintptr(unsafe.Pointer(&info.ExpertSize)),
+		uintptr(unsafe.Pointer(&info.TotalExperts)),
+		uintptr(unsafe.Pointer(&info.ResidentExperts)),
+	)
+	return info
 }

@@ -103,3 +103,47 @@ func (l *Loader) StreamToCudaBatch(filePath string, fileOffsets []uint64, sizes 
 func CudaAlloc(size uint64) uint64                  { return 0 }
 func CudaFree(ptr uint64)                           {}
 func CudaDtoH(srcCudaPtr uint64, dest []byte) error { return ErrNotAvailable }
+
+// --- VMM stubs ---
+func VMMAvailable() bool                                  { return false }
+func VMMGetGranularity() uint64                           { return 0 }
+func VMMReserve(size, alignment uint64) uint64            { return 0 }
+func VMMFree(vaPtr, size uint64) error                    { return ErrNotAvailable }
+func VMMCreatePhysical(size uint64) uint64                { return 0 }
+func VMMReleasePhysical(physHandle uint64) error          { return ErrNotAvailable }
+func VMMMap(vaPtr, size, physHandle, offset uint64) error { return ErrNotAvailable }
+func VMMUnmap(vaPtr, size uint64) error                   { return ErrNotAvailable }
+
+// --- Expert Pool stubs ---
+
+type ExpertPool struct {
+	handle uintptr
+}
+
+type ExpertPoolStats struct {
+	Hits          uint64
+	Misses        uint64
+	Evictions     uint64
+	BytesStreamed uint64
+}
+
+type ExpertPoolInfo struct {
+	VASize          uint64
+	PhysSize        uint64
+	ExpertSize      uint64
+	TotalExperts    uint32
+	ResidentExperts uint32
+}
+
+func NewExpertPool(loader *Loader, expertSize uint64, totalExperts uint32, physPoolSize uint64) (*ExpertPool, error) {
+	return nil, ErrNotAvailable
+}
+func (p *ExpertPool) Close() {}
+func (p *ExpertPool) SetFileInfo(expertIdx uint32, fileOffset, fileSize uint64) error {
+	return ErrNotAvailable
+}
+func (p *ExpertPool) SetModelPath(path string) error         { return ErrNotAvailable }
+func (p *ExpertPool) EnsureLoaded(expertIdxs []uint32) error { return ErrNotAvailable }
+func (p *ExpertPool) GetPtr(expertIdx uint32) uint64         { return 0 }
+func (p *ExpertPool) GetStats() ExpertPoolStats              { return ExpertPoolStats{} }
+func (p *ExpertPool) GetInfo() ExpertPoolInfo                { return ExpertPoolInfo{} }
