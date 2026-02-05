@@ -966,6 +966,7 @@ OLLAMA_NEW_ENGINE=false → textProcessor == nil  → StartRunner(ollamaEngine=f
 | ALIENTELLIGENCE/psychologist | 808f0b15c923 | 4.7 GB | sha256-6a0746a1ec1a... |
 | mistral:7b-instruct | 6577803aa9a0 | 4.4 GB | sha256-f5074b1221da... |
 | cas/alma-r | ff5076c6bb31 | 4.1 GB | sha256-d0900d04fedc... |
+| gpt-oss:20b | (new) | 12.9 GB | sha256-e7b273f9636059a6... |
 | gemma3:4b / gemma3:latest | a2af6cc3eb7f | 3.3 GB | sha256-aeda25e63ebd... |
 
 Model blobs are stored at: `C:\Users\danie\.ollama\models\blobs\`
@@ -1078,7 +1079,13 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Modified file: `ollama-patches/ggml.go` (copy of patched Ollama source)
     - Compiles cleanly: `go build github.com/ollama/ollama/ml/backend/ggml` succeeds
 
-18. **Full Ollama Binary Build + End-to-End Testing** — Built and tested complete Ollama binary with DirectStorage:
+18. **Batch StreamToCuda Optimization** — Added `ds_loader_stream_to_cuda_batch()` which processes all GPU tensors with one file open, one fence+event, and one staging buffer. Restructured `ggml.go` to collect all GPU tensors first, then call batch API, then standard I/O for CPU/special tensors. Results:
+    - **2.4x faster model loading:** 9.15s → 3.83s for deepseek-r1:7b
+    - Eliminated 337 file opens and 337 fence+event creates per model load
+    - Now within 20% of stock Ollama (3.83s vs 3.17s) — and stock reads from RAM cache while we read from SSD
+    - DLL now exports 28 functions total (27 + 1 batch)
+
+19. **Full Ollama Binary Build + End-to-End Testing** — Built and tested complete Ollama binary with DirectStorage:
     - **Build process:** `CGO_ENABLED=1` with MinGW GCC (`C:\mingw64\bin`), no CUDA SDK or CMake needed. Binary: 183 MB.
     - **Build command:** `export PATH="/c/mingw64/bin:$PATH" && export CGO_ENABLED=1 && go build -v -o ollama_ds.exe .` from `C:\Users\danie\Documents\ollama`
     - **Runtime lib junction:** `C:\Users\danie\Documents\ollama\lib\ollama` → `C:\Users\danie\AppData\Local\Programs\Ollama\lib\ollama`
@@ -1090,6 +1097,12 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
       - Model produces correct output (math, reasoning, thinking all verified)
       - Load time: ~6.9s for weight streaming (cold SSD) vs ~1.1s stock Ollama (OS cache)
     - **Benchmark:** DirectStorage ~606 MB/s from SSD vs stock ~3,800 MB/s from OS cache. DirectStorage wins when model exceeds RAM.
+
+20. **gpt-oss:20b Testing (12.9 GiB model on 8 GiB VRAM)** — Tested with a model too large for VRAM:
+    - Ollama splits: **15/25 layers on GPU (6.7 GiB)**, 10/25 layers on CPU (6.2 GiB)
+    - DirectStorage streamed **285 GPU tensors (6,832.5 MB)** via SSD → GPU bypass
+    - Inference: 12.7 tok/s (comparable to stock Ollama's 13.3 tok/s)
+    - **Key insight:** Dynamic per-token layer streaming would NOT help dense models — streaming 5.2 GB per token from SSD (5.2s/tok = 0.19 tok/s) is 65x slower than CPU inference (~30ms for 10 layers). Dynamic streaming only viable for MoE models where each token activates 2-8 experts out of 64.
 
 ---
 
@@ -1103,7 +1116,7 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 4. ~~**D3D12-CUDA interop**~~ — **DONE.** See Section 13, item 15. Full D3D12-CUDA memory sharing with LUID matching, shared heaps, and CUDA device pointers. Verified byte-perfect across 21 tests.
 
-5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-18. `Backend.Load()` in `ggml.go` uses `StreamToCuda` for GPU-bound tensors. Full Ollama binary built and tested end-to-end with deepseek-r1:7b. 338 GPU tensors (4.1 GiB) streamed via DirectStorage. Correct inference verified.
+5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-20. `Backend.Load()` uses batch `StreamToCudaBatch` for GPU-bound tensors. Tested with deepseek-r1:7b (338 tensors, 4.1 GiB) and gpt-oss:20b (285 tensors, 6.7 GiB). Load time within 20% of stock Ollama. DLL exports 28 functions.
 
 6. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
 
@@ -1143,41 +1156,63 @@ Built `ollama_ds.exe` (183 MB) with DirectStorage integration. Tested with deeps
 
 **Benchmark: deepseek-r1:7b (4.1 GiB GPU weights, Q4_K_M)**
 
-| Metric | Stock Ollama (std I/O) | DirectStorage |
-|--------|----------------------|---------------|
-| load_duration (API) | 3.17s | 9.15s |
-| Weight load time (commit→done) | ~1.1s | ~6.9s |
-| Throughput | ~3,800 MB/s (OS cache) | ~606 MB/s (SSD) |
-| Data path | SSD → OS cache → CPU RAM → cudaMemcpy → GPU | SSD → DMA → D3D12 staging → cuMemcpyDtoD → GPU |
-| Touches CPU RAM? | Yes (full model copy) | No (zero-copy) |
-| OS page cache required? | Yes | No |
+| Metric | Stock Ollama (std I/O) | DS (per-tensor) | DS (batch) |
+|--------|----------------------|-----------------|------------|
+| load_duration (API) | 3.17s | 9.15s | **3.83s** |
+| Weight load time | ~1.1s | ~6.9s | ~2.5s |
+| Throughput | ~3,800 MB/s (OS cache) | ~606 MB/s | ~1,088 MB/s |
+| Data path | SSD → OS cache → CPU RAM → cudaMemcpy → GPU | SSD → DMA → staging → DtoD → GPU | Same, batched |
+| Touches CPU RAM? | Yes (full model copy) | No (zero-copy) | No (zero-copy) |
+| File opens per load | 339 (one per goroutine) | 338 | **1** |
+| Fence/event creates | N/A | 338 | **1** |
 
-**Analysis:** For a 7B model that fits in RAM, standard I/O from OS cache is ~6x faster because it reads from RAM (~3.8 GB/s) while DirectStorage reads from NVMe SSD (~600 MB/s). The real advantage of DirectStorage is when:
-1. Model exceeds system RAM (no OS cache available)
-2. Multiple large models swap without RAM thrashing
-3. 70B+ MoE models where only active expert weights need VRAM residency
+**gpt-oss:20b (12.9 GiB model, 8 GiB VRAM):**
 
-### Priority 1 (current): Optimize DirectStorage Loading Speed
+| Metric | Stock Ollama | DirectStorage (batch) |
+|--------|-------------|----------------------|
+| GPU layers | 15/25 | 15/25 |
+| GPU weight data | 6.7 GiB | 6.7 GiB (285 tensors via DS) |
+| CPU weight data | 6.2 GiB | 6.2 GiB (standard I/O) |
+| load_duration | 8.28s | 9.66s |
+| Inference | 13.3 tok/s | 12.7 tok/s |
 
-DirectStorage loading is currently ~6x slower than cached I/O for warm models. Potential optimizations:
-1. **Parallelize StreamToCuda calls** — Currently serialized via mutex (single staging buffer). Use multiple staging buffers or pipeline DMA + copy.
-2. **Batch multiple tensors into single DMA** — Group small tensors into larger contiguous reads
-3. **Implement mmap-like hybrid** — Use OS page cache when model fits in RAM, DirectStorage only for overflow
-4. **Pre-warm staging buffer** — Avoid auto-grow overhead on first large tensor
+**Analysis:**
+1. For models that fit in RAM, stock Ollama's cached I/O is still faster, but batch DS is now within 20%.
+2. For gpt-oss:20b, both paths use the same 15/10 GPU/CPU layer split. DS advantage is modest because the GPU layers also benefit from OS cache in stock Ollama.
+3. **Dynamic per-token layer streaming does NOT help dense models** — streaming 5.2 GB from SSD per token = 0.19 tok/s vs 13 tok/s with CPU inference. Only viable for MoE models (load 2-8 experts, not all layers).
+4. The real DS advantage emerges when: model exceeds system RAM (no OS cache), multiple large models swap without RAM thrashing, or MoE expert streaming.
 
-### Priority 2: Streamer CUDA Integration
+### ~~Priority 1: Optimize DirectStorage Loading Speed~~ — DONE
 
-Update the `streamer/` package to optionally create shared GPU buffers and export them to CUDA. This gives the streamer direct CUDA device pointers that GGML can use.
+Batch StreamToCuda eliminated 337 file opens + 337 fence creates. Load time: 9.15s → 3.83s (2.4x). Now within 20% of stock Ollama reading from RAM cache. See Section 13, item 18.
+
+### Priority 1 (current): MoE Expert Streaming
+
+The real target use case. For MoE models (Mixtral, DeepSeek MoE), each token only activates 2-8 experts out of 64. Stream only active expert weights per token:
+- At 1 GB/s, loading 500 MB of expert weights = 0.5s per token (~2 tok/s)
+- With async prefetch (predict next-layer experts): could hide most latency
+- Requires: hook into gating/routing layer, identify active experts, stream before compute
+- **Prerequisite:** Download and test a MoE model (Mixtral 8x7B = 24 GiB, or DeepSeek V2 Lite)
+
+### Priority 2: CUDA Virtual Memory Management (VMM)
+
+Use cuMemAddressReserve/cuMemCreate/cuMemMap to overcommit VRAM:
+- Allocate virtual address space for entire model (e.g., 24 GB virtual, 7 GB physical)
+- Map/unmap physical pages as layers are needed
+- Gives GGML valid CUDA pointers for all tensors → all ops route to GPU
+- No GGML modifications needed — transparent to the compute graph
+- This is the key enabler for running any model on any VRAM size
 
 ### Priority 3: Problems 2, 3
 
-Activation checkpointing and sliding window KV cache — required for production use with 70B models but can be tackled after the basic inference path works.
+Activation checkpointing and sliding window KV cache — free up VRAM for more weight data. Less critical now that we understand dense model streaming doesn't help (CPU inference is faster than SSD streaming for dense models).
 
-### Priority 4: Test with Larger Models
+### Priority 4: Squeeze More Layers onto GPU
 
-Test with models that stress system RAM:
-- codestral (12.6 GB) — likely pushes RAM limits
-- Download and test a 70B MoE model — the actual target use case
+For dense models like gpt-oss:20b, fitting 20/25 layers on GPU instead of 15/25 would directly improve inference speed. Options:
+- Reduce KV cache allocation (shorter context, quantized KV)
+- Use flash attention to reduce compute buffer
+- Smaller batch size
 
 ---
 
@@ -1196,3 +1231,5 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Ollama Backend.Load() integration — Modified ggml.go to import dstorage package, detect GPU tensors via ggml_backend_buffer_is_host(), call StreamToCuda for CUDA-bound tensors with fallback to standard I/O. Compiles cleanly. Patched file saved to ollama-patches/ggml.go.
 - 2026-02-05: Full Ollama binary built (183 MB). Discovered Backend.Load() only runs with OLLAMA_NEW_ENGINE=true (ollamarunner). Old engine (llamarunner) uses C++ weight loading, never calls our Go code.
 - 2026-02-05: End-to-end test SUCCESS with deepseek-r1:7b + OLLAMA_NEW_ENGINE=true. DirectStorage activated: 338 GPU tensors (4,168.1 MB) streamed via SSD→GPU bypass. Model produces correct output (math, reasoning, thinking verified). Benchmark: DirectStorage ~606 MB/s from SSD vs stock ~3,800 MB/s from OS cache.
+- 2026-02-05: Batch StreamToCuda optimization — ds_loader_stream_to_cuda_batch() opens file once, reuses single fence+event. Load time: 9.15s → 3.83s (2.4x faster). Now within 20% of stock Ollama. DLL exports 28 functions. All 24 tests pass.
+- 2026-02-05: Tested gpt-oss:20b (12.9 GiB) — 15/25 layers on GPU, 285 tensors (6.8 GiB) streamed via DirectStorage. Inference: 12.7 tok/s. Discovered dynamic per-token streaming is NOT viable for dense models (0.19 tok/s vs 13 tok/s CPU). Only viable for MoE expert streaming.
