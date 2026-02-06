@@ -220,12 +220,18 @@ The per-layer budget (62.5MB/layer) allows ~5 expert packages per layer, which i
 
 ### Cache Knee Experiment (Feb 6, 2026)
 
-| Cache | Hit Rate | ws_size | Per-layer Budget |
-|-------|----------|---------|------------------|
-| 1500MB | **78.6%** | 4 | 62.5MB (~5 experts) |
-| 1000MB | **14.1%** | 29-32 | 41.7MB (~3 experts) |
+| Cache | Per-layer | Experts/layer | Hit Rate | ws_size |
+|-------|-----------|---------------|----------|---------|
+| 1500MB | 62.5MB | ~5 | **79%** | 4 |
+| 1250MB | 52.1MB | ~4 | **79%** | 4 |
+| 1100MB | 45.8MB | ~3.5 | **49%** | 4 |
+| 1000MB | 41.7MB | ~3 | **14%** | 29-32 |
 
-**Finding:** The knee is between 1000-1500MB. With <3 experts per layer budget, hit rate collapses from 78% to 14%. The ws_size=29-32 at 1000MB reveals that over 32 tokens, nearly all 32 experts get requested - meaning good routing locality requires sufficient per-layer budget to avoid thrashing.
+**Findings:**
+- **Knee is at ~3.5 experts/layer** (1100MB total)
+- **TopK+0 or TopK+1** experts/layer gives stable 79% hit rate
+- **Below TopK-0.5** causes hit rate collapse and ws_size explosion
+- **Minimum viable cache:** TopK experts × 13.2MB × 24 layers ≈ 1250MB for TopK=4
 
 ## What to Verify
 

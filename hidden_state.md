@@ -1,188 +1,284 @@
-This is exactly the right instrumentation.
+✅ Turn your results into a real cache policy
 
-And based on what you described, Path A is behaving the way a real MoE scheduler should.
 
 
+From your table:
 
-There is only one real gap left before this becomes a meaningful systems test:
 
 
+TopK = 4
 
-👉 you currently have no eviction, so your hit-rate numbers are artificially optimistic.
+Stable region = 4–5 experts per layer
 
+Knee = ~3.5
 
+Thrash = 3
 
-You even noted it:
 
 
 
-evictions = 0 (not implemented yet)
 
+That gives you a deterministic rule:
 
 
 
+👉 Per-layer resident target
 
-That matters a lot for the next decision (whether Path B is needed).
+resident\_experts\[layer] = TopK + 0  (minimum)
 
+resident\_experts\[layer] = TopK + 1  (safe default)
 
 
-✅ What you’ve already validated (this is important)
 
 
 
-From your verbose logs:
+In practice:
 
 
 
-You’ve proven all four of the critical correctness properties:
+target = 5 experts per GPU layer
 
 
 
-✔ Per-token routing
 
-Layer 0, token 0 -> ...
 
-Layer 0, token 1 -> ...
+So the first real product change is:
 
 
 
+🔧 Replace “fair MB split” with a count-based floor
 
 
-Good. Not batch-level.
 
+Instead of:
 
 
-✔ Per-layer routing
 
-Layer 0 -> experts A
+MB\_per\_layer = total\_MB / num\_layers
 
-Layer 1 -> experts B
 
 
 
 
+Do:
 
-Good. Not global.
 
 
+for each GPU layer:
 
-✔ Same token maps differently across layers
+&nbsp;   guarantee space for (TopK + 1) expert packages
 
 
 
-That’s very important.
 
-It means your approximation is not degenerate.
 
+Then distribute any remaining memory as overflow.
 
 
-✔ No duplicate loads inside a single forward
 
+This immediately prevents the 1000MB thrash case.
 
 
-That tells me your residency check path is correct.
 
+✅ Make the cache self-tuning (tiny change, big payoff)
 
 
-⚠️ The big caveat right now
 
+You already compute:
 
 
-Your current stats:
 
+working\_set\_size\[layer]
 
 
-hits ~92%
 
-loads ~12
 
-evictions = 0
 
+So the correct adaptive policy is now obvious:
 
 
 
+👉 Adaptive target per layer
 
-With no eviction:
+target\[layer] = max(TopK, working\_set\_size\[layer]) + 1
 
 
 
-your cache only grows
 
 
+Clamp to a global max if you want.
 
-nothing is ever forced out
 
 
+This gives you:
 
-so reuse naturally climbs
 
 
+automatic resizing
 
-This does not tell you whether the scheduler is viable under real memory pressure.
 
 
+per-layer specialization
 
-Right now you are testing:
 
 
+no hardcoding for future models
 
-routing correctness
 
-not
 
-paging behavior
+This is exactly how real memory systems evolve.
 
 
 
-🎯 The single most important next step
+✅ Add one guardrail (prevents future regressions)
 
 
 
-Before touching Path B at all:
+Add a warning log when:
 
 
 
-👉 implement a minimal eviction policy
+resident\_capacity\[layer] < TopK
 
 
 
-It does not need to be fancy.
 
 
+That is a guaranteed thrash zone.
 
-You already have the right unit:
 
 
+You already empirically proved it.
 
-“expert package” per (layer, expert\_id)
 
 
+🧠 Important: what you have actually learned
 
-So the minimal thing is:
 
 
+This line from your results is critical:
 
-maxResidentExpertsPerLayer
 
 
+TopK experts is not the working set.
 
+TopK is the instantaneous demand.
 
+The working set is TopK plus temporal overlap.
 
-or
 
 
+Your data says:
 
-maxResidentBytes
 
 
+temporal overlap ≈ 0–1 experts
 
 
 
-and then:
 
 
+Which is why:
 
-evict least recently used expert package
+
+
+4 works
+
+
+
+5 is safe
+
+
+
+3.5 starts degrading
+
+
+
+3 collapses
+
+
+
+This is exactly what paging theory predicts.
+
+
+
+🚫 What NOT to do yet
+
+
+
+Do not go to Path B yet.
+
+
+
+You already proved:
+
+
+
+routing locality exists
+
+
+
+cache geometry dominates performance
+
+
+
+routing accuracy is not your limiting factor
+
+
+
+If you switch to exact routing now, you will still have:
+
+
+
+the same knee.
+
+
+
+Path B only improves:
+
+
+
+which experts are chosen
+
+
+
+It does not change:
+
+
+
+how many experts must be resident to avoid thrash.
+
+
+
+✅ The correct next technical milestone
+
+👉 Implement adaptive per-layer expert budgets
+
+
+
+That is the real upgrade.
+
+
+
+Specifically:
+
+
+
+Track working\_set\_size\[layer] (you already do)
+
+
+
+Compute:
+
+
+
+desired = max(TopK, ws\_size) + 1
+
+
+
+
+
+Ensure LRU for that layer never evicts below desired
 
 
 
@@ -190,289 +286,71 @@ That’s it.
 
 
 
-🧪 The exact test you should run after eviction exists
+✅ After that (small, optional win)
 
 
 
-Once eviction is wired:
+Once the cache is stable:
 
 
 
-Test 1 – small budget
+Add a very simple prefetch:
 
 
 
-Artificially cap residency:
+When routing predicts experts for token t:
 
 
 
-EXPERT\_CACHE\_LIMIT = k \* 2   (e.g. 8 experts total)
+→ enqueue loads immediately
 
+→ before Phase B barrier
 
 
 
+You don’t need look-ahead tokens yet.
 
-Then run your same story prompt.
 
 
+This will hide DS latency and make your hit rate matter even more.
 
-You want to see:
 
 
+🟢 When Path B actually becomes useful
 
-hits drop
 
-loads increase
 
-evictions start happening
+Only after you have:
 
-BUT
 
-forward still completes
 
+adaptive budgets
 
 
-🔍 The real signal you are looking for
 
+stable cache
 
 
-After eviction exists, look at:
 
+prefetch
 
 
-hit\_rate over time
 
+Then Path B becomes about:
 
 
 
+improving correctness and quality
 
-If you see:
 
 
+not:
 
-hit rate stabilizes at a reasonable value (even 40–60%)
 
 
+saving the runtime.
 
-and you are not reloading the same experts every token
 
 
-
-→ your scheduling architecture is sound.
-
-
-
-If instead you see:
-
-
-
-constant churn
-
-
-
-near-zero reuse
-
-
-
-constant evict → load → evict → load
-
-
-
-→ then Path B will not fix that.
-
-That would be a routing / locality problem.
-
-
-
-⚠️ One very subtle but important thing you should log
-
-
-
-Right now you log:
-
-
-
-Layer N: hits, loads, evictions
-
-
-
-
-
-Add this:
-
-
-
-uniqueExpertsRequested
-
-
-
-
-
-per layer.
-
-
-
-Why?
-
-
-
-Because if your token-based router is exploding the expert fan-out (very high entropy), eviction will become impossible to stabilize.
-
-
-
-This is the hidden failure mode of token-only routing.
-
-
-
-🧠 Important observation about your current high hit rate
-
-
-
-Because you route purely from:
-
-
-
-token id
-
-
-
-
-
-you are getting:
-
-
-
-very strong locality
-
-
-
-heavy reuse for common tokens
-
-
-
-punctuation and whitespace tokens collapsing to the same experts
-
-
-
-That is fine.
-
-
-
-But keep in mind:
-
-
-
-This is a best-case cache pattern.
-
-
-
-So:
-
-
-
-Don’t interpret a 90% hit rate as “routing is good”.
-
-
-
-Interpret it as:
-
-
-
-the runtime can exploit locality if it exists.
-
-
-
-That’s exactly what you want to prove at this stage.
-
-
-
-✅ So here is the clean next step checklist
-
-
-
-Do not jump to Path B yet.
-
-
-
-Do this first:
-
-
-
-1\. Add LRU eviction for expert packages
-
-
-
-Layer-local or global — either is fine.
-
-
-
-2\. Cap cache aggressively
-
-
-
-Force pressure.
-
-
-
-3\. Re-run the same prompt
-
-
-
-Observe:
-
-
-
-evictions
-
-
-
-reuse curve
-
-
-
-reload frequency
-
-
-
-🟢 Only after that…
-
-
-
-Then your stated next step becomes meaningful:
-
-
-
-Measure actual vs predicted expert overlap
-
-
-
-Because until eviction exists, overlap numbers do not reflect a real system.
-
-
-
-Very honest assessment
-
-
-
-You are now past:
-
-
-
-“can I drive paging from routing?”
-
-
-
-You are now testing:
-
-
-
-“can this be scheduled under pressure?”
-
-
-
-That is the real Phase-2 milestone.
-
-
-
-You’re doing this in exactly the right order.
+Right now your runtime is already viable.
 
