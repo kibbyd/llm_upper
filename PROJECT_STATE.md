@@ -170,6 +170,7 @@ Key insight from the research document (`idea.md`):
 | `idea.md` | The five problems defined, what solving them enables, the relationship between streaming and MoE |
 | `DIRECTSTORAGE_LLM_RESEARCH.md` | Hardware specs, measured SSD speeds, DirectStorage API overview, architecture diagram |
 | `PROJECT_STATE.md` | THIS FILE — complete project documentation |
+| `next_level.md` | Block-Dense approach documentation — splitting dense FFN into K independent blocks that sum to exact original output, enabling streaming for ANY dense model |
 | `ollama-patches/ggml.go` | Patched copy of `ml/backend/ggml/ggml.go` with DirectStorage integration in `Backend.Load()`. This file goes at `C:\Users\danie\Documents\ollama\ml\backend\ggml\ggml.go`. |
 
 ### DirectStorage Module (in `C:\Users\danie\Documents\ollama\ml\backend\ggml\dstorage\`)
@@ -1104,6 +1105,19 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Inference: 12.7 tok/s (comparable to stock Ollama's 13.3 tok/s)
     - **Key insight:** Dynamic per-token layer streaming would NOT help dense models — streaming 5.2 GB per token from SSD (5.2s/tok = 0.19 tok/s) is 65x slower than CPU inference (~30ms for 10 layers). Dynamic streaming only viable for MoE models where each token activates 2-8 experts out of 64.
 
+22. **gpt-oss:20b MoE Discovery and Expert Pool Infrastructure** — Major discovery: gpt-oss:20b is actually an MoE model!
+    - **32 experts per layer, 4 active per token (12.5% activation)** — not dense as previously thought
+    - Expert tensor naming: `blk.X.ffn_gate_exps.weight`, `blk.X.ffn_up_exps.weight`, `blk.X.ffn_down_exps.weight`
+    - Per-expert size: ~4.2 MB (MXFP4 quantized), 24 layers × 3 tensors = 72 expert tensors total
+    - **Expert Pool infrastructure added to ggml.go:**
+      - Detects MoE via `gptoss.expert_count` metadata key
+      - Creates `dstorage.ExpertPool` for each expert tensor
+      - Pool configuration: 32 experts total, 16 experts physical (~67 MB per pool)
+      - Log: "MoE expert streaming: 72 expert tensors, 32 experts each, streaming on demand"
+    - **Current status:** Pools created but EnsureLoaded not yet wired to Forward()
+    - **Inference verified working:** ~14 tok/s, correct output, 7.3 GB / 8 GB VRAM used
+    - **This makes gpt-oss:20b our primary MoE test case** — previously we were using qwen3:30b
+
 21. **codestral Testing (12.6 GiB model, 57 layers) — 4x Faster Model Loading** — The breakthrough result:
     - Ollama splits: **30/57 layers on GPU (6.1 GiB)**, 27 layers on CPU (5.6 GiB)
     - DirectStorage streamed GPU tensors via SSD → GPU bypass
@@ -1232,15 +1246,30 @@ Implemented full CUDA VMM support:
 - 3 new tests pass: VMM available, granularity = **2 MB**, reserve/map/unmap/remap cycle works
 - **This enables VRAM overcommit** — reserve 20 GB VA space, back with 6 GB physical, map/unmap experts on demand
 
-### Priority 1 (current): Expert Streaming Integration
+### Priority 1 (current): Expert Streaming Integration — IN PROGRESS
 
-Now that VMM is working, next steps:
-1. **Expert allocator** — Track which VA ranges map to which physical allocations
-2. **DirectStorage + VMM integration** — Stream data into mapped VA regions
-3. **LRU eviction** — When physical pool full, unmap oldest experts
-4. **Ollama hook** — Intercept expert selection (routing layer output) to trigger streaming
+**Completed this session:**
+1. **Expert Pool infrastructure** — `NewExpertPool()`, `SetFileInfo()`, `SetModelPath()`, `GetPtr()` APIs in DLL and Go bindings
+2. **MoE detection in ggml.go** — Detects `gptoss.expert_count` (and similar) metadata, creates pools for each expert tensor
+3. **gpt-oss:20b verified as MoE** — 32 experts/layer, 4 active/token, perfect test case for streaming
+4. **72 expert pools created** — For gpt-oss:20b (24 layers × 3 tensors), each pool handles 16 of 32 experts in physical memory
 
-**Target:** All 48 layers on GPU, only active experts backed by physical memory. Should improve from 17.0 tok/s (40% GPU) toward 25+ tok/s (100% GPU).
+**What's working:**
+- Expert pool creation: ✅
+- DirectStorage for non-expert tensors: ✅ (240 tensors, 781 MB)
+- Inference with expert pools: ✅ (14 tok/s, correct output)
+- Expert tensors load via standard path (temporary fallback)
+
+**Next steps to complete streaming:**
+1. **Wire EnsureLoaded to Forward()** — Call `expertPool.EnsureLoaded(expertIndices)` before MLP computation in model files
+2. **Handle the prediction problem** — Options:
+   - Load all K active experts before each layer (simpler, ~50 MB per layer for gpt-oss)
+   - Predictive prefetch based on previous token's expert selections
+   - Two-pass: compute routing first, read indices, load experts, then full forward
+3. **VMM-backed pools** — Use VMM for memory overcommit instead of pre-allocated buffers
+4. **LRU eviction** — When physical pool full, evict least-recently-used experts
+
+**Target:** All 24 layers on GPU for gpt-oss:20b with only active experts in physical VRAM. Currently 15/25 layers fit; with streaming, all should fit.
 
 ### Priority 3: Problems 2, 3
 
@@ -1275,3 +1304,17 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
 - 2026-02-05: Tested codestral (12.6 GiB) — **4x faster model loading** (5.4s vs 22.2s stock). This confirmed the scaling insight: DirectStorage advantage GROWS with model size because OS cache becomes less effective while DirectStorage throughput stays constant. Inference speed identical (3.9 vs 4.0 tok/s) since both use same GPU/CPU layer split.
 - 2026-02-05: Downloaded and analyzed qwen3:30b MoE model (18.6 GB). Key findings: 48 layers, 128 experts per layer, 8 active per token (6.25%), expert tensors are 17.55 GB (94.6% of model!). Per-expert size ~3 MB. 8 active experts × 48 layers = 1.17 GB of expert weights per token. Stock Ollama runs at 17.0 tok/s with 40% GPU / 60% CPU split.
 - 2026-02-05: Implemented CUDA Virtual Memory Management (VMM) — 8 new DLL exports (vmm_available, vmm_get_granularity, vmm_reserve, vmm_free, vmm_create_physical, vmm_release_physical, vmm_map, vmm_unmap). Go bindings for all 8 functions. 3 new tests pass: VMM is available, granularity is 2 MB, reserve/map/unmap/remap cycle works. This enables overcommitting VRAM for MoE expert streaming. DLL now exports 36 functions. All 27 tests pass.
+- 2026-02-05: **MAJOR DISCOVERY: gpt-oss:20b is MoE, not dense!** Found 32 experts per layer, 4 active per token (12.5% activation). Expert tensor names: `blk.X.ffn_gate_exps.weight`, `blk.X.ffn_up_exps.weight`, `blk.X.ffn_down_exps.weight`. Per-expert size: ~4.2 MB (MXFP4 quantized). This changes everything — we can test MoE expert streaming with gpt-oss:20b.
+- 2026-02-05: Added Expert Pool infrastructure to ggml.go:
+  - Detects MoE models via `gptoss.expert_count` or similar metadata keys
+  - Creates `dstorage.ExpertPool` for each expert tensor using `NewExpertPool()`, `SetFileInfo()`, `SetModelPath()`
+  - 72 pools created for gpt-oss:20b (24 layers × 3 tensors: gate, up, down)
+  - Each pool: 32 experts total, 16 experts physical (67 MB per pool), per-expert size 4.2 MB
+  - Log output: "MoE expert streaming: 72 expert tensors, 32 experts each, streaming on demand"
+- 2026-02-05: Fixed tensor name matching bug — changed from `strings.HasSuffix(t.Name, "_exps")` to `strings.Contains(t.Name, "_exps") && strings.HasSuffix(t.Name, ".weight")`. Actual tensors like `blk.0.ffn_gate_exps.weight` now detected correctly.
+- 2026-02-05: Verified gpt-oss:20b inference working with expert pool infrastructure:
+  - Model loads in 6.04 seconds, 15/25 layers on GPU
+  - DirectStorage: 240 GPU tensors (781.3 MB) via SSD→GPU bypass (non-expert tensors)
+  - Expert tensors currently load via standard path (streaming not yet wired to Forward())
+  - Inference: ~14 tok/s generation, correct output ("Hello!" with thinking chain)
+  - GPU memory: 7.3 GB / 8 GB used
