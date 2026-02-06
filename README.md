@@ -167,17 +167,53 @@ DirectStorage: enabled for GPU tensor loading (SSD -> GPU bypass)
 DirectStorage: streamed 285 GPU tensors (6832.5 MB) via SSD -> GPU bypass
 ```
 
-## What's Next: MoE Expert Streaming
+## MoE Expert Streaming (Working!)
 
-The current implementation accelerates **model loading** (one-time cost). The next frontier is **per-token expert streaming** for Mixture-of-Experts models.
+**Expert streaming is now functional.** GPU-resident expert tensors are streamed on-demand from SSD during the first inference, then cached for subsequent tokens.
 
-MoE models (Mixtral 8x7B, DeepSeek V2) only activate 2-8 experts per token out of 64+. Instead of loading the entire model, stream only the active expert weights from SSD to GPU per token. The infrastructure is already built:
+### How It Works
 
-- **LRU residency manager** - Tracks which experts are in VRAM, evicts least-recent
-- **Async prefetch** - Streams next layer's experts while current layer computes (73% I/O reduction)
-- **Batch DMA** - Efficient bulk transfers with minimal overhead
+```
+Model Load (fast):
+  - Non-expert tensors: Loaded via DirectStorage batch (781 MB in ~2s)
+  - Expert tensors: Allocated but NOT loaded (saves ~6 GB transfer)
 
-This could enable running 70B+ MoE models on 8 GB VRAM - models that normally require 48+ GB.
+First Inference:
+  - Forward() calls EnsureExpertTensorLoaded() for each layer
+  - DirectStorage streams expert data SSD -> GPU (~134 MB per tensor, ~60ms each)
+  - 45 expert tensors streamed = ~6 GB total
+
+Subsequent Inferences:
+  - Expert tensors already in GPU memory
+  - No streaming overhead
+```
+
+### Test Results (gpt-oss:20b - 24 layers, 32 experts/layer)
+
+```
+Architecture:
+  Layers 0-8:   CPU (standard load with MXFP4 byte reordering)
+  Layers 9-23:  GPU (DirectStorage streaming, 45 tensors)
+
+Performance:
+  Model load:     ~3s (expert tensors deferred)
+  First inference: +3s streaming overhead (one-time)
+  Generation:     ~14 tok/s
+  Caching:        Works - no re-streaming on subsequent inferences
+```
+
+### Key Implementation Details
+
+1. **Auto-detection**: Models with `expert_count` metadata trigger expert streaming
+2. **Hybrid loading**: CPU-resident layers use standard path (with MXFP4 byte reordering), GPU-resident layers use DirectStorage
+3. **Loader persistence**: DirectStorage loader stays open for on-demand streaming (not closed after initial load)
+4. **Tensor registry**: `EnsureExpertTensorLoaded()` tracks which tensors are loaded, streams on first access
+
+### Future Optimizations
+
+- **Active-only streaming**: Currently loads all 32 experts per layer. Could load only the 4 active experts per token (8x less data).
+- **Predictive prefetching**: Stream next layer's experts while current layer computes
+- **Larger models**: Test with qwen3:30b (128 experts) to validate scaling
 
 **Important:** Per-token streaming only works for MoE models. For dense models, CPU inference of offloaded layers (~13 tok/s) is 65x faster than streaming all layers from SSD (~0.19 tok/s). The math only works when you're loading a fraction of the weights per token.
 
