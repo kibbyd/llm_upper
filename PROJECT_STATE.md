@@ -1125,6 +1125,49 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
     - Inference: 3.9 tok/s (identical to stock's 4.0 tok/s — same GPU/CPU split)
     - **The scaling insight:** DirectStorage advantage GROWS with model size. Standard I/O degrades as OS cache becomes less effective for larger models, while DirectStorage maintains constant SSD throughput. The bigger the model, the bigger the win. This is the opposite of how things normally work — loading gets *faster relative to the alternative* as models get bigger.
 
+23. **MoE Active-Only Expert Loading Attempts** — Investigated two approaches to load only active experts per token:
+
+    **Approach 1: Two-Phase Forward (FAILED)**
+    - Idea: During Forward(), compute routing first, read expert indices from GPU, load only active experts, then continue with expert MLP
+    - Implementation: Added `ctx.Compute(selectedExperts)` mid-Forward() in gptoss/model.go
+    - Problem: GGML doesn't support mid-Forward() Compute calls. The scheduler resets after Compute(), breaking the computation graph. Connection crash: "wsarecv: An existing connection was forcibly closed"
+    - Learning: GGML builds a computation graph during Forward() and executes it atomically. Partial execution is not supported.
+
+    **Approach 2: Speculative Loading (PARTIALLY IMPLEMENTED)**
+    - Idea: Use previous token's expert selections to predict next token's experts
+    - Implementation:
+      - Added `RegisterExpertSelection(layerIdx, tensor)` to store selectedExperts tensors during Forward()
+      - Added `ProcessExpertSelections()` to call after Compute() to read indices and update predictions
+      - Added `GetPredictedExperts(layerIdx)` to retrieve predictions for next token
+      - Hooked into `runner/ollamarunner/runner.go` to call ProcessExpertSelections after ComputeWithNotify
+    - Problem: **GGML tensor.Floats() returns empty for intermediate tensors**
+      - Only tensors passed to `Compute(tensors...)` get a `sync` function assigned
+      - `selectedExperts` is an intermediate tensor in the graph, not passed to Compute
+      - When Floats() is called, `t.sync == nil` so it returns empty slice
+    - Status: Infrastructure in place but tensor readback doesn't work
+    - Files modified:
+      - `model/models/gptoss/model.go`: Speculative loading logic in MLPBlock.Forward()
+      - `ml/backend/ggml/dstorage/dstorage_windows.go`: GetPredictedExperts, RegisterExpertSelection, ProcessExpertSelections, etc.
+      - `ml/backend/ggml/dstorage/dstorage_stub.go`: Stubs for non-Windows
+      - `runner/ollamarunner/runner.go`: ProcessExpertSelections call after Compute
+
+    **Index Readback Latency Benchmarks (from earlier session)**
+    - 16 bytes (4 expert indices): 7 µs via cuMemcpyDtoH
+    - 1536 bytes (48 layers × 8 experts): 9 µs
+    - Conclusion: GPU→CPU index readback is trivially fast (~0.1ms total)
+
+    **Estimated Two-Phase Overhead**
+    - Index readback: ~0.13 ms
+    - Expert streaming: ~370 ms (for 15 layers × 4 experts × 3 tensors)
+    - Current (all experts): ~3000 ms (6 GB)
+    - Potential speedup: 8.1x
+
+    **Next Steps for Active-Only Loading**
+    1. **Explicit output tensor**: Add selectedExperts to Compute() output list so it gets sync function
+    2. **CPU-side routing**: Compute routing weights on CPU, then call GPU with known experts
+    3. **Profile-based preloading**: Track most-used experts statistically, always preload top-N
+    4. **Dedicated callback**: Add hook in GGML for intermediate tensor readback
+
 ---
 
 ## 14. WHAT WAS NOT DONE YET
