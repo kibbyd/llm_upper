@@ -1338,3 +1338,18 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
     - First inference: +3s streaming overhead (one-time)
     - Caching verified: subsequent inferences have 0 streaming overhead
     - Model produces correct output ("Hello! How can I help you today?")
+- 2026-02-06: **Per-expert loading infrastructure** for active-only streaming:
+  - Added `EnsureExpertLoaded(tensorName, expertIdx)` — loads single expert (~4.2 MB)
+  - Added `EnsureExpertsLoaded(tensorName, []indices)` — loads batch efficiently
+  - Added per-expert caching: `expertLoaded[tensor][idx]` tracks individual experts
+  - Added `GetLoadedExpertCount()` for monitoring
+  - Modified `gptoss/model.go` to use new API (currently loads all 32 experts)
+  - **Test results:**
+    - 1440 individual expert loads (45 tensors × 32 experts)
+    - Per-expert caching verified (second inference: 0 loads)
+    - Correct output maintained
+  - **THE PREDICTION PROBLEM:** To achieve 8x savings (load 4 instead of 32), we need to know which experts are active BEFORE loading. But routing computes indices DURING Forward() via `selectedExperts := routingWeights.TopK()`. Options:
+    - A. Two-phase forward: Compute routing, read indices, load experts, compute rest (complex)
+    - B. Speculative: Use previous token's experts, on-demand fallback (medium, ~6x savings)
+    - C. Profile-based: Preload most common experts (simple, ~2-4x savings)
+  - **Current state:** Infrastructure ready for 8x savings once prediction problem is solved
