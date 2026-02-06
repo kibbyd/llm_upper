@@ -1,68 +1,356 @@
-# Adaptive Per-Layer Expert Cache - IMPLEMENTED
+✅ Turn your results into a real cache policy
 
-## What Was Done (Feb 6, 2026)
 
-### 1. Added per-layer floor tracking
-- `expertCountByLayer[layer]` - tracks resident expert count per layer
-- `targetExpertsByLayer[layer]` - adaptive target floor per layer
 
-### 2. Implemented adaptive target formula
-```
-target_experts[layer] = max(TopK, working_set_size[layer]) + 1
-```
-- `updateTargetExperts(layerIdx)` - updates target based on current working set
-- Called automatically before each cache operation
+From your table:
 
-### 3. Enforced floor in LRU eviction
-```go
-if layerCount <= targetExperts {
-    // At floor - can't evict, allow overflow
-    break
-}
-```
-- Eviction only happens for entries above the floor
-- Allows temporary byte budget overflow to preserve stability
 
-### 4. Added thrash warning guardrail
-```
-WARNING: Layer X has capacity for only Y experts but TopK=Z.
-This is a guaranteed thrash zone. Increase EXPERT_CACHE_LIMIT_MB.
-```
 
-### 5. Stats output updated
-```
-[expert-stats] Layer N: hits=X loads=Y evictions=Z ws_size=W resident=R target=T (hit rate: P%)
-```
+TopK = 4
 
-## Git Commit
-```
-050fdd2d feat: adaptive per-layer expert cache with count-based floor
-```
+Stable region = 4–5 experts per layer
 
-## Files Modified
-- `ml/backend/ggml/dstorage/dstorage_windows.go`
+Knee = ~3.5
 
-## New APIs
-- `SetModelTopK(topK int)` - Set the model's TopK value
-- `GetModelTopK() int` - Get current TopK value
-- `GetLayerCacheInfo(layerIdx) (residentCount, targetExperts)` - Per-layer info
+Thrash = 3
 
-## Testing Notes
 
-Initial test with 1000MB limit showed 0 resident experts despite loads happening.
-This appears to be a model integration issue - the expert tensors aren't being
-registered through `RegisterExpertTensor`, so `EnsureExpertLoaded` returns early.
 
-The cache policy logic is correct. Further integration work needed to ensure
-expert tensors are properly registered before Forward() calls.
 
-## Next Steps
 
-1. **Verify expert tensor registration** - Ensure `RegisterExpertTensor` is called
-   for all expert tensors during model load
+That gives you a deterministic rule:
 
-2. **Hook SetModelTopK** - Call from model.go when TopK is known
 
-3. **Re-run knee tests** once registration is fixed
 
-4. **Simple prefetch** - After cache is stable, add prefetching to hide DirectStorage latency
+👉 Per-layer resident target
+
+resident\_experts\[layer] = TopK + 0  (minimum)
+
+resident\_experts\[layer] = TopK + 1  (safe default)
+
+
+
+
+
+In practice:
+
+
+
+target = 5 experts per GPU layer
+
+
+
+
+
+So the first real product change is:
+
+
+
+🔧 Replace “fair MB split” with a count-based floor
+
+
+
+Instead of:
+
+
+
+MB\_per\_layer = total\_MB / num\_layers
+
+
+
+
+
+Do:
+
+
+
+for each GPU layer:
+
+&nbsp;   guarantee space for (TopK + 1) expert packages
+
+
+
+
+
+Then distribute any remaining memory as overflow.
+
+
+
+This immediately prevents the 1000MB thrash case.
+
+
+
+✅ Make the cache self-tuning (tiny change, big payoff)
+
+
+
+You already compute:
+
+
+
+working\_set\_size\[layer]
+
+
+
+
+
+So the correct adaptive policy is now obvious:
+
+
+
+👉 Adaptive target per layer
+
+target\[layer] = max(TopK, working\_set\_size\[layer]) + 1
+
+
+
+
+
+Clamp to a global max if you want.
+
+
+
+This gives you:
+
+
+
+automatic resizing
+
+
+
+per-layer specialization
+
+
+
+no hardcoding for future models
+
+
+
+This is exactly how real memory systems evolve.
+
+
+
+✅ Add one guardrail (prevents future regressions)
+
+
+
+Add a warning log when:
+
+
+
+resident\_capacity\[layer] < TopK
+
+
+
+
+
+That is a guaranteed thrash zone.
+
+
+
+You already empirically proved it.
+
+
+
+🧠 Important: what you have actually learned
+
+
+
+This line from your results is critical:
+
+
+
+TopK experts is not the working set.
+
+TopK is the instantaneous demand.
+
+The working set is TopK plus temporal overlap.
+
+
+
+Your data says:
+
+
+
+temporal overlap ≈ 0–1 experts
+
+
+
+
+
+Which is why:
+
+
+
+4 works
+
+
+
+5 is safe
+
+
+
+3.5 starts degrading
+
+
+
+3 collapses
+
+
+
+This is exactly what paging theory predicts.
+
+
+
+🚫 What NOT to do yet
+
+
+
+Do not go to Path B yet.
+
+
+
+You already proved:
+
+
+
+routing locality exists
+
+
+
+cache geometry dominates performance
+
+
+
+routing accuracy is not your limiting factor
+
+
+
+If you switch to exact routing now, you will still have:
+
+
+
+the same knee.
+
+
+
+Path B only improves:
+
+
+
+which experts are chosen
+
+
+
+It does not change:
+
+
+
+how many experts must be resident to avoid thrash.
+
+
+
+✅ The correct next technical milestone
+
+👉 Implement adaptive per-layer expert budgets
+
+
+
+That is the real upgrade.
+
+
+
+Specifically:
+
+
+
+Track working\_set\_size\[layer] (you already do)
+
+
+
+Compute:
+
+
+
+desired = max(TopK, ws\_size) + 1
+
+
+
+
+
+Ensure LRU for that layer never evicts below desired
+
+
+
+That’s it.
+
+
+
+✅ After that (small, optional win)
+
+
+
+Once the cache is stable:
+
+
+
+Add a very simple prefetch:
+
+
+
+When routing predicts experts for token t:
+
+
+
+→ enqueue loads immediately
+
+→ before Phase B barrier
+
+
+
+You don’t need look-ahead tokens yet.
+
+
+
+This will hide DS latency and make your hit rate matter even more.
+
+
+
+🟢 When Path B actually becomes useful
+
+
+
+Only after you have:
+
+
+
+adaptive budgets
+
+
+
+stable cache
+
+
+
+prefetch
+
+
+
+Then Path B becomes about:
+
+
+
+improving correctness and quality
+
+
+
+not:
+
+
+
+saving the runtime.
+
+
+
+Right now your runtime is already viable.
+

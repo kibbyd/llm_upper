@@ -1182,21 +1182,15 @@ For testing DirectStorage with a real model, we used the deepseek-r1:7b blob:
 
 5. ~~**Ollama integration**~~ — **DONE.** See Section 13, items 16-20. `Backend.Load()` uses batch `StreamToCudaBatch` for GPU-bound tensors. Tested with deepseek-r1:7b (338 tensors, 4.1 GiB) and gpt-oss:20b (285 tensors, 6.7 GiB). Load time within 20% of stock Ollama. DLL exports 28 functions.
 
-6. ~~**Expert routing prediction (Path A)**~~ — **DONE.** Token-based expert routing predicts which 4 experts each layer needs using token embeddings. Per-layer LRU eviction with working set tracking. 79% hit rate at 1250MB cache. 8x bandwidth reduction validated. See Update Log 2026-02-06.
+6. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
 
-7. **Adaptive per-layer budgets** — Replace "fair MB split" with count-based floor: `target[layer] = max(TopK, ws_size) + 1`. This would make the cache self-tuning.
+7. **GPU decompression** — DirectStorage supports GDeflate decompression on the GPU during transfer. Not implemented.
 
-8. **Simple prefetch for expert streaming** — Enqueue expert loads immediately when routing predicts them, before expert compute. Hide DirectStorage latency.
+8. ~~**Prefetching**~~ — **DONE.** See Section 13, item 14.
 
-9. **Problems 2, 3** — Activation checkpointing and sliding window KV cache are not started.
+9. **Streamer tests** — No unit tests for the `streamer/` package yet. The demo validates behavior but formal tests are needed.
 
-10. **GPU decompression** — DirectStorage supports GDeflate decompression on the GPU during transfer. Not implemented.
-
-11. ~~**Prefetching (layer-level)**~~ — **DONE.** See Section 13, item 14.
-
-12. **Streamer tests** — No unit tests for the `streamer/` package yet. The demo validates behavior but formal tests are needed.
-
-13. **Streamer CUDA integration** — The `streamer/` package still creates standard GPU buffers (`CreateGPUBuffer`). It should be updated to optionally use `CreateSharedGPUBuffer` + `ExportToCuda` so that prefetched tensors are directly accessible by CUDA/GGML.
+10. **Streamer CUDA integration** — The `streamer/` package still creates standard GPU buffers (`CreateGPUBuffer`). It should be updated to optionally use `CreateSharedGPUBuffer` + `ExportToCuda` so that prefetched tensors are directly accessible by CUDA/GGML.
 
 ---
 
@@ -1325,45 +1319,11 @@ Implemented full CUDA VMM support:
 2. **Predictive prefetch** — Stream next layer's experts during current layer compute
 3. **VMM-backed pools** — Use VMM for memory overcommit instead of pre-allocated buffers
 
-### Priority 1 (Current): Adaptive Per-Layer Expert Budgets
-
-The key insight from cache knee profiling: TopK is instantaneous demand, but working set = TopK + temporal overlap (~0-1 experts).
-
-**Implementation:**
-```
-target[layer] = max(TopK, working_set_size[layer]) + 1
-```
-
-This would:
-- Replace "fair MB split" with a count-based floor
-- Guarantee each layer can hold at least TopK+1 experts
-- Prevent the 1000MB thrash case automatically
-- Make the cache self-tuning based on observed working set
-
-**Guardrail:** Log warning when `resident_capacity[layer] < TopK` — guaranteed thrash zone.
-
-### Priority 2: Simple Prefetch
-
-Once the cache is stable, add prefetching:
-- When routing predicts experts for token t, enqueue DirectStorage loads immediately
-- Before Phase B barrier (expert compute)
-- Hides DirectStorage latency, makes hit rate matter even more
-- Don't need look-ahead tokens yet — just overlap DMA with compute
-
-### Priority 3: Path B (Only After Above)
-
-Path B (exact routing via GGML kernel hooks) is only useful after:
-- Adaptive budgets implemented
-- Cache stable
-- Prefetch working
-
-Then Path B becomes about improving correctness/quality, not saving the runtime. The runtime is already viable.
-
-### Priority 4: Problems 2, 3
+### Priority 3: Problems 2, 3
 
 Activation checkpointing and sliding window KV cache — free up VRAM for more weight data. Less critical now that we understand dense model streaming doesn't help (CPU inference is faster than SSD streaming for dense models).
 
-### Priority 5: Squeeze More Layers onto GPU
+### Priority 4: Squeeze More Layers onto GPU
 
 For dense models like gpt-oss:20b, fitting 20/25 layers on GPU instead of 15/25 would directly improve inference speed. Options:
 - Reduce KV cache allocation (shorter context, quantized KV)
@@ -1436,44 +1396,3 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
     - B. Speculative: Use previous token's experts, on-demand fallback (medium, ~6x savings)
     - C. Profile-based: Preload most common experts (simple, ~2-4x savings)
   - **Current state:** Infrastructure ready for 8x savings once prediction problem is solved
-- 2026-02-06: **PATH A COMPLETE — Token-Based Expert Routing with 8x Bandwidth Reduction**
-  - **The Solution:** Predict which 4 experts (of 32) each layer needs using token embeddings, BEFORE GGML graph execution
-  - **Key Insight:** Token embedding × router weight matrix = routing scores. TopK(scores) = predicted experts. This runs on CPU before Forward(), giving us expert IDs without mid-graph interruption.
-  - **Implementation:**
-    - Added `Tokens []int32` field to `model/input/Batch` struct
-    - Modified `runner/ollamarunner/runner.go` to populate `batch.Tokens` before `Forward()`
-    - Modified `model/models/gptoss/model.go` to compute routing from tokens, cache embedding/router tensors
-    - Added `RecordExpertsForToken(layer, token, []expertIDs)` to track predictions for cache analysis
-  - **Per-Layer LRU Eviction:**
-    - Each layer maintains its own LRU cache with per-layer budget
-    - Prevents cross-layer eviction thrash (layer 0 experts don't evict layer 23 experts)
-    - Budget calculation: `perLayerBudget = EXPERT_CACHE_LIMIT_MB / numLayers`
-  - **Working Set Tracking:**
-    - Ring buffer of 32 tokens per layer
-    - Each entry = set of expert IDs requested for that token
-    - `ws_size` = unique experts across entire window (measures cache pressure)
-  - **Cache Knee Profile (Critical Finding):**
-    | Cache | Per-layer | Experts/layer | Hit Rate | ws_size |
-    |-------|-----------|---------------|----------|---------|
-    | 1500MB | 62.5MB | ~5 | **79%** | 4 |
-    | 1250MB | 52.1MB | ~4 | **79%** | 4 |
-    | 1100MB | 45.8MB | ~3.5 | **49%** | 4 |
-    | 1000MB | 41.7MB | ~3 | **14%** | 29-32 |
-  - **Key Findings:**
-    - Knee at ~3.5 experts/layer (1100MB total)
-    - TopK+0 or TopK+1 experts/layer gives stable 79% hit rate
-    - Below TopK-0.5 causes hit rate collapse and ws_size explosion
-    - Minimum viable cache: TopK × 13.2MB × 24 layers ≈ 1250MB for TopK=4
-  - **8x Bandwidth Reduction Validated:** Loading 4 active experts instead of 32 = 10GB → 1.3GB per forward pass
-  - **GGML Column-Major Shape Handling:** Fixed tensor shape interpretation. GGML uses column-major storage. When `tensor.Shape()` returns `[A, B]`: hiddenDim=shape[0], vocabSize/numExperts=shape[1]
-  - **Environment Variables:**
-    - `OLLAMA_EXPERT_ROUTING=approx` — Enable token-based routing
-    - `OLLAMA_EXPERT_ROUTING_VERBOSE=1` — Per-token logging + stats
-    - `EXPERT_CACHE_LIMIT_MB=1250` — Recommended minimum for TopK=4
-  - **Git Commits (ollama fork/main):**
-    - `1ba1b77a` feat: add working_set_size tracking per layer
-    - `e0c4b4ba` feat: per-layer LRU eviction for expert cache
-    - `f49ccfaa` fix: correct GGML column-major shape interpretation for routing
-    - `a77b5f93` feat: LRU eviction for expert cache with configurable limit
-    - `d38faac9` feat: Path A token-based expert routing prediction
-  - **Path B (Exact Routing) NOT NEEDED:** Path A proves routing locality exists and cache geometry dominates performance. Path B would only improve which experts are chosen, not how many must be resident. The runtime architecture is validated.
