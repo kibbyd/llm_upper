@@ -218,6 +218,15 @@ With per-layer LRU eviction and 1500MB cache:
 
 The per-layer budget (62.5MB/layer) allows ~5 expert packages per layer, which is enough to retain hot experts across tokens.
 
+### Cache Knee Experiment (Feb 6, 2026)
+
+| Cache | Hit Rate | ws_size | Per-layer Budget |
+|-------|----------|---------|------------------|
+| 1500MB | **78.6%** | 4 | 62.5MB (~5 experts) |
+| 1000MB | **14.1%** | 29-32 | 41.7MB (~3 experts) |
+
+**Finding:** The knee is between 1000-1500MB. With <3 experts per layer budget, hit rate collapses from 78% to 14%. The ws_size=29-32 at 1000MB reveals that over 32 tokens, nearly all 32 experts get requested - meaning good routing locality requires sufficient per-layer budget to avoid thrashing.
+
 ## What to Verify
 
 1. **Different experts per layer**: Layer 0 should differ from Layer 1
