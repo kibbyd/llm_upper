@@ -96,13 +96,25 @@ Tracks per-layer:
 - `evictions` - experts evicted to make room
 - `unique_requested` - unique experts requested (tracks fan-out)
 
-### LRU Eviction
+### Per-Layer LRU Eviction
 
 When `EXPERT_CACHE_LIMIT_MB` is set:
-- Experts tracked in LRU order (most recent at end)
-- When cache exceeds limit, least recently used experts are evicted
+- **Per-layer budgets**: Total cache divided by number of layers
+- Each layer maintains its own LRU list
+- Eviction only happens within the same layer (prevents cross-layer thrash)
 - Evicted experts are unmarked as loaded (will reload if needed again)
 - Eviction stats tracked per layer
+
+**Budget calculation:**
+```
+perLayerBudget = EXPERT_CACHE_LIMIT_MB / numLayers
+expertPackageSize = 3 tensors × 4.4MB = ~13.2MB
+expertsPerLayer = perLayerBudget / expertPackageSize
+```
+
+**Minimum cache for hits:** perLayerBudget must be >= 2× expertPackageSize.
+- 500MB / 24 layers = 20.8MB/layer = ~1.5 experts → 0% hits (too small)
+- 1500MB / 24 layers = 62.5MB/layer = ~5 experts → ~45% hits
 
 ## Environment Variables
 
@@ -193,7 +205,18 @@ Expected behavior under pressure:
 [routing] Layer 17: 1 tokens -> unique experts [15 25 26 19]
 ```
 
-**Note on 0% hit rate:** With 500MB cache and 24 layers needing ~1.3GB per pass, experts are evicted before the next token's layer 0 starts. This is expected - a larger cache (1.5GB+) or layer-aware eviction would improve hit rates.
+### Per-Layer LRU Results (Feb 6, 2026)
+
+With per-layer LRU eviction and 1500MB cache:
+
+| Layer Range | Hit Rate | Notes |
+|-------------|----------|-------|
+| 0-8 (CPU) | 0% | No eviction needed, fits in budget |
+| 9-23 (GPU) | **~45%** | Reuse across tokens working |
+
+**Cache efficiency:** 882 MB used / 1500 MB limit (210 experts cached)
+
+The per-layer budget (62.5MB/layer) allows ~5 expert packages per layer, which is enough to retain hot experts across tokens.
 
 ## What to Verify
 
