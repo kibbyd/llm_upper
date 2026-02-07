@@ -2200,6 +2200,86 @@ This is no longer a toy loader. This is an actual MoE streaming runtime with:
    - MoE models trained with temporal locality objectives
    - Or accept that MoE models require full working-set VRAM
 
+- 2026-02-07: **CRITICAL FIX: Separated profiling mode from production mode**
+
+   ### Problem
+   
+   qwen3:30b was exploding system RAM because router surgery profiling infrastructure ran on EVERY inference:
+   - TopK duplicate tensors (heavy graph nodes)
+   - ReadbackTopKForProfiling (GPU readback)
+   - RecordExpertUsage (accumulating maps)
+   - Batch fault trackers (per-batch maps)
+   
+   These should only run during **calibration** (learning expert masks), not during **production** (using masks).
+   
+   ### The Two-Phase Architecture
+   
+   | Phase | Mode | What Runs | Memory |
+   |-------|------|-----------|--------|
+   | **Calibration** | `OLLAMA_ROUTER_PROFILE=1` | TopK readback, usage profiling, mask generation | Heavy (temporary) |
+   | **Production** | Default (no env var) | `routerLogits + biasMask` only | Light |
+   
+   ### Implementation
+   
+   **1. Added `routerProfilingEnabled` global switch (dstorage_windows.go)**
+   ```go
+   // Controlled by OLLAMA_ROUTER_PROFILE=1 environment variable
+   routerProfilingEnabled bool
+   
+   func IsProfilingEnabled() bool {
+       return routerProfilingEnabled && !profilingComplete
+   }
+   ```
+   
+   **2. Guard profiling code with IsProfilingEnabled()**
+   
+   Files modified:
+   - `ml/backend/ggml/dstorage/dstorage_windows.go`: Added variable and function
+   - `ml/backend/ggml/dstorage/dstorage_stub.go`: Added stub
+   - `model/models/qwen3/model.go`: Changed guard from `!IsProfilingComplete()` to `IsProfilingEnabled()`
+   - `runner/ollamarunner/runner.go`: Changed guards for ReadbackTopKForProfiling and token counting
+   
+   **3. Disable profiling after FinalizeRouterSurgery()**
+   ```go
+   func cleanupProfilingState() {
+       routerProfilingEnabled = false  // Added
+       // ... existing cleanup ...
+   }
+   ```
+   
+   ### Test Results
+   
+   **Before fix:** qwen3:30b failed with "model requires more system memory than available"
+   
+   **After fix:**
+   ```
+   [router-surgery] Initialized with limit=24 experts per layer (production mode, no profiling)
+   ```
+   
+   - qwen3:30b loads successfully in 24.6s (8.4s load, 16s prompt eval)
+   - `steady_avg_faults=0.000` (perfect caching after warmup)
+   - Model produces correct output with thinking chain
+   
+   ### Usage Pattern
+   
+   ```bash
+   # Production (default) - runs light, no profiling overhead
+   OLLAMA_EXPERT_LIMIT=24 ./ollama_ds.exe serve
+   
+   # Calibration (once per model) - generates expert masks
+   OLLAMA_EXPERT_LIMIT=24 OLLAMA_ROUTER_PROFILE=1 ./ollama_ds.exe serve
+   # Run 64+ tokens, FinalizeRouterSurgery() saves masks
+   # Masks persist for future sessions
+   ```
+   
+   ### Key Insight
+   
+   > **Routing is cheap. Profiling is expensive.**
+   >
+   > The line `routerLogits + biasMask` is trivial.
+   > The observer infrastructure (TopK readback, maps, trackers) is what explodes RAM.
+   > These should never run together in production.
+
 ---
 
 ## END OF DOCUMENT
