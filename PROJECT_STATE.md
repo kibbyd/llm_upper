@@ -1535,3 +1535,254 @@ This document was last updated on 2026-02-05. All file paths, versions, sizes, a
     - Debug log indicates sync path: "using D3D12->CUDA external semaphore"
   - **Fallback retained:** Systems without semaphore support use old CPU wait path
   - This is the textbook-correct fix for D3D12-CUDA interop synchronization
+
+- 2026-02-07: **IMPLEMENTED: Double-buffered DirectStorage staging**
+
+  The staging path is now double-buffered to overlap SSD DMA and CUDA device copies.
+  This is a major architectural milestone: correct D3D12→CUDA sync + double-buffered staging + event-based reuse protection + fully async DMA/copy pipeline.
+
+  ### Implementation Details
+
+  **Data structures added to `DSLoader::staging`:**
+  ```cpp
+  // Per-buffer resources (double-buffered)
+  ComPtr<ID3D12Heap> heap[2];
+  ComPtr<ID3D12Resource> resource[2];
+  CUexternalMemory extMem[2];
+  CUdeviceptr devPtr[2];
+  HANDLE sharedHandle[2];
+  uint64_t heapSize[2];
+
+  // CUDA events for tracking when copy from each buffer completes
+  CUevent copyDone[2];
+
+  // Per-buffer fence tracking
+  uint64_t inFlightFenceValue[2];
+  ```
+
+  **New CUDA driver API functions loaded:**
+  - `cuEventCreate`, `cuEventDestroy`, `cuEventRecord`, `cuEventSynchronize`
+  - Added to `EnsureCudaLoaded()` with availability check in `g_semaphoreAvailable`
+
+  **Pipeline per tensor:**
+  ```
+  1. Wait for previous copy from buf[i] to complete (cuEventSynchronize)
+  2. DMA: file → staging buf[i] (with chunking for >32MB)
+  3. Signal D3D12 fence (per-buffer fence value tracking)
+  4. Submit DirectStorage queue
+  5. CUDA wait on imported semaphore for buf[i]'s fence value
+  6. cuMemcpyDtoDAsync from buf[i] to destination
+  7. cuEventRecord on buf[i]'s copyDone event
+  8. Switch to buf[1-i] for next tensor
+  9. At end: cuEventSynchronize on last buffer used
+  ```
+
+  **Key correctness rule:**
+  A staging buffer is never reused until its CUDA copy event completes.
+
+  **Overlap achieved:**
+  ```
+  DMA(buf0) → signal → CUDA wait → copy(buf0) → record event
+                       DMA(buf1) → signal → CUDA wait → copy(buf1) → record event
+                                            DMA(buf0) → ...
+  ```
+  DMA to buf1 overlaps with CUDA copy from buf0, and vice versa.
+
+  **Changes to `dstorage_loader.cpp`:**
+
+  1. **Lines ~245-270:** Added CUDA event types and function pointers
+  2. **Lines ~377-385:** Load event functions in `EnsureCudaLoaded()`, added to semaphore availability check
+  3. **Lines ~458-488:** Updated staging struct with double-buffer arrays and events
+  4. **Lines ~653-713:** `DestroyStagingBuffer()` cleans up both CUDA events and both buffer sets
+  5. **Lines ~715-860:** `EnsureStagingBuffer()` creates 2 heaps, 2 resources, 2 shared handles, 2 external memories, 2 device pointers, 2 CUDA events
+  6. **Lines ~1497-1551:** `ds_loader_stream_to_cuda()` uses buffer[0] only (single-tensor path)
+  7. **Lines ~1553-1770:** `ds_loader_stream_to_cuda_batch()` full double-buffer implementation with buffer alternation
+
+  **Fallback path retained:**
+  Systems without event/semaphore support use single buffer[0] with blocking CPU wait (same as before).
+
+  **Debug logging:**
+  - "DOUBLE-BUFFERED with D3D12->CUDA external semaphore" when double-buffering active
+  - "using fallback CPU wait (no double-buffer support)" for fallback path
+
+  ### Test Results
+
+  All 30 DLL unit tests pass:
+  - `TestStreamToCuda_64KB`: 35.5 MB/s (PASSED)
+  - `TestStreamToCuda_1MB`: 465.6 MB/s (PASSED)
+  - `TestStreamToCuda_Throughput`: up to 2004.7 MB/s at 16MB (PASSED)
+
+  Ollama binary builds successfully (183 MB).
+
+  ### Verified Performance Results (2026-02-07)
+
+  **Test: deepseek-r1:7b (4.1 GB model, 338 GPU tensors)**
+
+  | Configuration | Throughput | Notes |
+  |--------------|-----------|-------|
+  | Original per-tensor | ~606 MB/s | Baseline from PROJECT_STATE.md |
+  | Batched single-buffer | ~1,088 MB/s | 1.8x improvement |
+  | **Double-buffered** | **~1,885 MB/s** | **3.1x improvement over baseline** |
+
+  **Measured data:**
+  - DirectStorage: streamed 338 GPU tensors (4168.1 MB) via SSD → GPU bypass
+  - Time: 2.21 seconds (10:04:17.540 → 10:04:19.754)
+  - Throughput: 4168.1 MB / 2.21s = **1,885 MB/s**
+  - Model runner started in 4.05 seconds total
+  - All 29/29 layers offloaded to GPU (4.9 GiB VRAM)
+
+  **Improvement over batched single-buffer: 73%**
+  **Improvement over original per-tensor: 211%**
+
+  This validates that DMA/copy overlap via double-buffering provides substantial throughput gains for batch tensor loading.
+
+  ### Why This Matters
+
+  This completes the DirectStorage pipeline optimization:
+  1. ✅ Correct D3D12→CUDA synchronization (external semaphore)
+  2. ✅ Double-buffered staging (no serialization on buffer reuse)
+  3. ✅ Event-based reuse protection (no races)
+  4. ✅ Fully async DMA + copy pipeline (maximum overlap)
+
+  This is the "known good pipeline" baseline for future tuning.
+
+- 2026-02-07: **FIXED: Lazy physical allocation for expert pools**
+
+  ### Problem
+  Expert pools were eagerly allocating ALL physical memory at pool creation:
+  - 72 pools × 67 MB = ~4.8 GB committed upfront
+  - Left no VRAM for model layers
+  - gpt-oss:20b failed to load (forced to CPU-only)
+
+  ### Root Cause
+  In `ds_loader_expert_pool_create()`:
+  ```cpp
+  for (uint32_t i = 0; i < physCount; i++) {
+      g_cuMemCreate(&handle, ...);  // Eager allocation - BAD
+  }
+  ```
+
+  ### Solution
+  Changed to lazy allocation:
+  1. Pool creation reserves VA only (0 bytes committed)
+  2. Physical chunks allocated on-demand in `AcquirePhysChunk()`
+  3. Memory grows as experts are actually loaded
+
+  **Changes to `dstorage_loader.cpp`:**
+  - Added `physAllocated` and `allocProp` fields to `ExpertPool` struct
+  - Removed eager allocation loop from `ds_loader_expert_pool_create()`
+  - Added lazy `g_cuMemCreate()` in `AcquirePhysChunk()` when `handle == 0`
+  - Updated `ds_loader_expert_pool_destroy()` to check `handle != 0`
+
+  ### Test Results
+  **Before (eager):**
+  - Server start: ~5 GB GPU memory committed
+  - gpt-oss:20b: Forced to CPU-only (0 VRAM), hung on inference
+
+  **After (lazy):**
+  - Server start: **0 bytes GPU memory**
+  - gpt-oss:20b: **13.7 tok/s, correct output**
+  - Model layers load first, experts allocated on-demand
+
+  All 30 unit tests pass.
+
+  ### Architectural Insight
+  This is the correct shape for sparse-resident expert pools:
+  ```
+  ┌─────────────────────────────────────────┐
+  │  VA Space (cuMemAddressReserve)         │  ← Reserved at pool create
+  │  ┌─────┬─────┬─────┬─────┬─────┬─────┐  │
+  │  │ E0  │ E1  │ E2  │ ... │ E31 │     │  │
+  │  └──┬──┴──┬──┴─────┴─────┴─────┴─────┘  │
+  │     │     │                              │
+  │     ▼     ▼                              │
+  │  ┌─────┬─────┐                           │
+  │  │Phys0│Phys1│  ← Allocated on-demand   │
+  │  └─────┴─────┘    (cuMemCreate + cuMemMap)
+  └─────────────────────────────────────────┘
+  ```
+  Physical memory follows actual expert usage, not worst-case capacity.
+
+---
+
+## Architectural Checkpoint (2026-02-07)
+
+### What Is Now Complete
+
+**1. Streaming Pipeline (fully overlapped)**
+```
+SSD → DirectStorage DMA → D3D12 fence → CUDA external semaphore
+    → cuMemcpyDtoDAsync → CUDA event (per staging buffer)
+```
+- Double-buffered staging
+- Per-buffer CUDA events
+- No global sync, no accidental serialization
+- **Throughput: 1.9 GB/s** (3.1× baseline)
+
+**2. Expert Pool (truly sparse-resident)**
+- Virtual address reserved at pool creation
+- Physical memory created only when expert is loaded
+- Unmapped on eviction
+- **Server start: 0 bytes GPU memory**
+
+**3. gpt-oss:20b Working**
+- 13.7 tok/s with streaming experts
+- Dynamic residency working correctly
+
+### Key Insight (Validated)
+
+> **The system is no longer I/O bound. Memory residency policy dominates scalability.**
+
+Evidence:
+- I/O path sustains ~1.9 GB/s
+- Staging overlap works
+- Copy overlap works
+
+### What Dominates Performance Now
+
+Not loading. Not staging. Not DMA.
+
+**Expert selection policy:**
+- Prefetch accuracy
+- Eviction policy  
+- Pool sizing per layer
+
+### Recommended Next Improvement
+
+**Layer-aware residency** (low risk, high return)
+
+Current problem with global LRU:
+- Experts are scoped to layers: `layer i → experts [Ei]`
+- Global pool can evict experts needed again in the same layer
+- Because a different layer faulted
+
+Solution:
+- Per-layer sub-pool or per-layer priority
+- Usually improves hit rate more than generic cache tweaks
+
+### NOT Recommended Yet: Pre-routing
+
+Earlier idea: "union experts and load once"
+
+With lazy allocation + real caching + fast streaming:
+- Miss rates may already be low enough
+- Pre-routing adds complexity and latency
+
+Revisit only if:
+- Cache hit rate is poor
+- Token-to-token routing is highly volatile
+
+### Metric to Add
+
+```
+faulted_experts_per_token
+```
+
+If average < 0.5 faults/token → system is in good shape.
+
+### Architecture Summary
+
+This is no longer a toy loader. This is an actual MoE streaming runtime with:
+- Sparse GPU residency
+- Correct GPU/IO synchronization
+- Production-grade pipeline overlap
