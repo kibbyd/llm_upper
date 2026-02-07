@@ -1909,6 +1909,297 @@ This is no longer a toy loader. This is an actual MoE streaming runtime with:
   A 70B model with similar routing behavior would require architectural changes
   (layer-streaming or more aggressive expert sharing across tokens).
 
+- 2026-02-07: **MoE Generalization Research: Code Already Supports Multiple MoE Models**
+
+  ### Key Finding
+  
+  The expert detection code is **already generalized** — no changes needed to support Mixtral, Qwen MoE, DeepSeek2, etc.
+  
+  ### How Expert Detection Works
+  
+  **Metadata detection (ggml.go line 524):**
+  ```go
+  if strings.HasSuffix(k, "expert_count") || k == "expert_count" {
+  ```
+  This matches ANY architecture-prefixed key:
+  - `llama.expert_count` (Mixtral)
+  - `qwen3moe.expert_count` (Qwen3 MoE)
+  - `deepseek2.expert_count` (DeepSeek2)
+  - `gptoss.expert_count` (gpt-oss)
+  - `glm4moelite.expert_count` (GLM4 MoE)
+  
+  **Tensor detection (ggml.go line 661):**
+  ```go
+  strings.Contains(t.Name, "_exps") && strings.HasSuffix(t.Name, ".weight")
+  ```
+  This matches the unified GGUF tensor naming:
+  - `blk.X.ffn_gate_exps.weight`
+  - `blk.X.ffn_up_exps.weight`
+  - `blk.X.ffn_down_exps.weight`
+  
+  ### Why It Works for All MoE Models
+  
+  All model converters in Ollama transform native tensor names to the standard GGUF format:
+  
+  | Model | Native Format | Converted GGUF Format |
+  |-------|--------------|----------------------|
+  | Mixtral | `blk.X.block_sparse_moe.experts.Y.*` | `blk.X.ffn_*_exps.weight` |
+  | Qwen3 MoE | `blk.X.ffn_gate_up_exps` (combined) | Split to `ffn_gate_exps` + `ffn_up_exps` |
+  | DeepSeek2 | `blk.X.mlp.experts.*.gate_proj` | `blk.X.ffn_gate_exps.weight` |
+  
+  The conversion happens in `convert/convert_*.go` files.
+  
+  ### qwen3:30b Available for Testing
+  
+  Local model `qwen3:30b` is a MoE model with excellent test characteristics:
+  
+  | Property | qwen3:30b | gpt-oss:20b |
+  |----------|-----------|-------------|
+  | Architecture | qwen3moe | gptoss |
+  | Experts per layer | **128** | 32 |
+  | Active per token | **8 (6.25%)** | 4 (12.5%) |
+  | Layers | 48 | 15 |
+  | Model size | 18 GB | 13 GB |
+  
+  **Potential for temporal sparsity:** With 128 experts and only 8 active, qwen3:30b could have a much smaller temporal working set than gpt-oss:20b.
+  
+  ### Testing Blocked by Ollama Desktop App
+  
+  The Ollama desktop app (systray) intercepts the server and respawns processes, preventing proper log capture.
+  
+  **To test properly:**
+  1. Right-click Ollama tray icon → Quit
+  2. Run: `OLLAMA_DEBUG=1 OLLAMA_NEW_ENGINE=true OLLAMA_EXPERT_ROUTING=exact ./ollama_ds.exe serve 2>&1 | tee qwen_test.log`
+  3. Test: `curl -s http://localhost:11434/api/generate -d '{"model": "qwen3:30b", "prompt": "Hello", "stream": false}'`
+  4. Check logs for `qwen3moe.expert_count` detection and `max_resident_per_layer` stats
+  
+  ### The Gating Test for 70B Feasibility
+  
+  Once logs are captured, check:
+  ```
+  max_resident_per_layer under no limit
+  ```
+  
+  - If `peak ≈ total` → **temporally dense** → won't fit on 8GB (like gpt-oss:20b)
+  - If `peak << total` → **temporally sparse** → our streaming system shines
+  
+  ### BLOCKER DISCOVERED: DirectStorage E_OUTOFMEMORY
+  
+  **Problem:** DirectStorage initialization fails with `E_OUTOFMEMORY` (HRESULT 0x8007000E) when running qwen3:30b.
+  
+  **Root Cause:**
+  - GGML initializes CUDA backend BEFORE `Backend.Load()` checks DirectStorage
+  - CUDA allocates most GPU memory for model tensors
+  - When `ds_loader_available()` tries to create a D3D12 device, not enough VRAM remains
+  - D3D12 device creation fails → DirectStorage reports "not available"
+  
+  **Evidence:**
+  ```
+  msg="DirectStorage availability check" dsAvailable=false cudaAvailable=true hresult=0x8007000E
+  ```
+  
+  **Why gpt-oss:20b worked:**
+  - Either GGML initialized differently (less VRAM allocated before DS check)
+  - Or the model left enough headroom for D3D12 device creation
+  - Or the tests ran before GGML backend loading
+  
+  **Fix Options:**
+  1. **Early initialization:** Check/create DirectStorage loader at server startup, before any model loads
+  2. **Lazy D3D12 device:** Don't create D3D12 device in `ds_loader_available()` - just check DLL loading
+  3. **Share CUDA context:** Use CUDA-created D3D12 device instead of creating a new one
+  4. **Reserve headroom:** Leave 100-200 MB VRAM for DirectStorage during model allocation
+  
+  ### Next Steps
+  
+  1. Fix DirectStorage initialization order issue
+  2. Then run qwen3:30b with proper logging
+  3. Measure `max_resident_per_layer` for each of the 48 layers
+  4. Compare temporal working set to gpt-oss:20b
+  5. If qwen3:30b is temporally sparse, it becomes the 70B proof-of-concept
+
+- 2026-02-07: **FIXED: E_OUTOFMEMORY DirectStorage initialization bug (Two-Part Fix)**
+
+   ### Root Cause
+   DirectStorage initialization was failing with `E_OUTOFMEMORY` (0x8007000E) because:
+   1. `ds_loader_available()` was calling `DStorageGetFactory()` which internally touches D3D12/DXGI
+   2. `ds_loader_create()` was being called in `Backend.Load()` AFTER GGML/CUDA had already consumed most VRAM
+   3. On Windows/WDDM, D3D12 device creation is a budgeted operation that fails when GPU memory is exhausted
+
+   ### Part 1: Fixed `ds_loader_available()`
+   Changed to only check DLL/symbol presence, not touch DirectStorage runtime:
+   ```cpp
+   int ds_loader_available() {
+       CoInitializeEx(NULL, COINIT_MULTITHREADED);
+       // Only check if DirectStorage DLLs load and required symbols exist.
+       // Do NOT touch any DirectStorage runtime objects here - not even the factory.
+       if (!EnsureDStorageLoaded()) {
+           g_lastHR = E_FAIL;
+           return 0;
+       }
+       g_lastHR = S_OK;
+       return 1;
+   }
+   ```
+
+   ### Part 2: Moved DirectStorage initialization to runner subprocess startup
+   Added global loader support to `dstorage_windows.go`:
+   ```go
+   var (
+       globalLoader     *Loader
+       globalLoaderInit bool
+       globalLoaderMu   sync.Mutex
+   )
+   
+   func Init() error { ... }           // Creates loader once at startup
+   func GetGlobalLoader() *Loader { ... }  // Returns cached global loader
+   ```
+
+   Added `Init()` call in **runner subprocess** (not main server - Ollama spawns separate runner processes):
+   ```go
+   // File: runner/ollamarunner/runner.go
+   // In Execute() function, right after logging setup:
+   if err := dstorage.Init(); err != nil {
+       slog.Warn("DirectStorage initialization failed", "error", err)
+   }
+   ```
+
+   Modified `Backend.Load()` to use global loader:
+   ```go
+   // File: ml/backend/ggml/ggml.go
+   dsLoader := dstorage.GetGlobalLoader()  // Instead of NewLoader()
+   // Removed Close() call - global loader persists for process lifetime
+   ```
+
+   ### The Correct Initialization Order
+   ```
+   Runner subprocess starts
+     → dstorage.Init() creates D3D12 device + DS factory (VRAM free)
+     → ml.NewBackend() allocates GGML/CUDA buffers (consumes VRAM)
+     → Backend.Load() uses GetGlobalLoader() (already created)
+     → Model runs with DirectStorage expert streaming
+   ```
+
+   ### Test Results
+   - Rebuilt `dstorage_loader.dll` and `ollama_ds.exe`
+   - Tested with qwen3:30b - model loads and runs successfully
+   - DirectStorage initialized: "DirectStorage initialized successfully at server startup"
+   - Expert pools created: 144 pools for 48 layers × 3 tensors
+   - Inference works: correct output with thinking chain
+
+- 2026-02-07: **FIXED: qwen3 model missing dstorage expert loading integration**
+
+   ### Problem
+   `max_resident_per_layer=0` was reported even though:
+   - Expert pools were created
+   - Experts were loaded
+   - Faults = 0
+   - Inference worked
+
+   Zero means the counter is never incremented or read from the wrong tracker.
+
+   ### Root Cause
+   The qwen3 model (`model/models/qwen3/model.go`) had NO dstorage integration!
+   - gptoss model: Has `dstorage.EnsureExpertsLoaded()` calls in MLPBlock.Forward()
+   - qwen3 model: Just directly calls `mlp.Gate.Forward()`, `mlp.Up.Forward()`, `mlp.Down.Forward()`
+
+   ### Fix
+   Added dstorage expert loading to qwen3/model.go:
+   1. Added imports: `fmt`, `os`, `dstorage`
+   2. Added `layerIdx int` field to `sparse` struct
+   3. Set `layerIdx` during construction: `layers[i].MLP = &sparse{layerIdx: i}`
+   4. Added dstorage integration to `sparse.Forward()`:
+      - Get predicted experts via `dstorage.GetPredictedExperts(layerIdx)`
+      - Record for working set: `dstorage.RecordExpertsForToken()`
+      - Prefetch: `dstorage.PrefetchExperts()`
+      - Ensure loaded: `dstorage.EnsureExpertsLoaded(gateName, ...)`, etc.
+      - Cold start fallback: loads all experts on first token (if no predictions)
+
+   ### Test Results
+   Now `max_resident_per_layer=384` is correctly reported (128 experts × 3 tensors)
+
+- 2026-02-07: **CRITICAL FINDING: Public MoE Models are Temporally Dense**
+
+   ### The Gating Test for 70B Feasibility
+   
+   Ran working-set squeeze test on qwen3:30b (128 experts/layer, 8 active/token):
+   
+   | Test | Cache Cap | steady_avg_faults | max_resident/layer | tok/s | Result |
+   |------|-----------|-------------------|-------------------|-------|--------|
+   | Unlimited | 18,000 MB | **0.00** | 384 (all) | ~70ms | OK |
+   | 96 experts | 13,500 MB | **~1,157** | N/A | ~3,000ms | **THRASH** |
+   
+   **Key findings:**
+   
+   1. **With unlimited cache:** Zero faults after cold start. All 128 × 3 = 384 experts per layer become resident.
+   2. **With 25% reduction (96 experts):** Catastrophic thrashing - **~1,157 faults/token!** (~24 expert loads per layer per token)
+   3. **Speed collapse:** ~70ms/token → ~3,000ms/token (43x slower)
+   
+   ### Both MoE Models Tested Are Temporally Dense
+   
+   | Model | Experts/Layer | TopK | Temporal Working Set | Result |
+   |-------|--------------|------|---------------------|--------|
+   | gpt-oss:20b | 32 | 4 | ≈32 (100%) | **Temporally dense** |
+   | qwen3:30b | 128 | 8 | ≈128 (100%) | **Temporally dense** |
+   
+   Both models show:
+   - `max_resident_per_layer ≈ total_experts_per_layer` with unlimited cache
+   - Catastrophic thrashing with even small capacity reduction (25% → 24 loads/layer/token)
+   
+   ### The Uncomfortable But Honest Conclusion
+   
+   > **The infrastructure is correct. The model routing behavior is the blocker.**
+   
+   These public MoE models are:
+   - ✅ **Sparse per token** (only 4-8 experts active)
+   - ❌ **Dense across time** (all experts touched eventually)
+   
+   This means:
+   - Our streaming runtime, eviction, and synchronization are all working correctly
+   - The 8x-16x theoretical savings from MoE sparsity **does not materialize temporally**
+   - Small-VRAM inference only works if the model is trained to be temporally sparse
+   
+   ### What Would Make a Model Work Beautifully With This System?
+   
+   A model where, per layer:
+   ```
+   unique experts used over 256 tokens << total experts
+   ```
+   
+   For example: ~8–16 experts reused out of 128.
+   
+   This requires:
+   - Router entropy penalties during training
+   - Expert stickiness regularization
+   - Explicit temporal locality objectives
+   
+   **This is a training/routing objective issue, not a runtime issue.**
+   
+   ### What We Built Is Still Valuable
+   
+   We now have:
+   1. **A correct streaming runtime** - DirectStorage SSD→GPU with proper cross-API sync
+   2. **A correct residency system** - Double-buffered staging, lazy VMM allocation, LRU eviction
+   3. **A real evaluation harness** - `max_resident_per_layer` and `steady_avg_faults` metrics
+   
+   Almost nobody else can measure **temporal routing entropy per layer**.
+   
+   This is exactly what's needed to evaluate whether future MoE models are viable for small-VRAM inference.
+   
+   ### Research Summary
+   
+   **What we proved:**
+   - DirectStorage + CUDA interop works for real-time weight streaming
+   - The pipeline can sustain ~1.9 GB/s SSD→GPU throughput
+   - Per-expert loading, prefetch, and eviction all function correctly
+   - Public MoE models (gpt-oss:20b, qwen3:30b) are temporally dense
+   
+   **What we didn't achieve:**
+   - Running 70B+ MoE on 8GB VRAM with current public models
+   
+   **What would be needed:**
+   - MoE models trained with temporal locality objectives
+   - Or accept that MoE models require full working-set VRAM
+
 ---
 
 ## END OF DOCUMENT
