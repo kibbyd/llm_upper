@@ -1860,6 +1860,55 @@ This is no longer a toy loader. This is an actual MoE streaming runtime with:
   
   But NOT from changing eviction policy.
 
+- 2026-02-07: **IMPLEMENTED: max_resident_per_layer tracking + VRAM squeeze test**
+
+  ### New Metric: max_resident_per_layer
+  
+  Tracks peak resident experts per layer during inference. Critical for 70B feasibility analysis.
+  
+  **Implementation:**
+  - Added `maxResidentByLayer` map in dstorage_windows.go
+  - Updated on every expert load (when count exceeds previous peak)
+  - Logged in final stats: `max_resident_per_layer`, `max_resident_layer`
+  - Added `GetMaxResidentByLayer()` and `GetMaxResidentSummary()` APIs
+  
+  ### VRAM Squeeze Test Results
+  
+  Artificially capped expert pool to force eviction:
+  
+  | Limit | steady_avg_faults | max_resident/layer | tok/s |
+  |-------|-------------------|-------------------|-------|
+  | **No limit** | **0.00** | 96 | ~13 |
+  | **5500 MB** (91%) | **~30** | ~87 | ~0.2 |
+  
+  **Key findings:**
+  
+  1. **gpt-oss:20b cache requirements:**
+     - Full cache: 15 layers × 96 experts × 4.2 MB = **6,048 MB**
+     - At 91% (5500 MB): Severe thrashing, 30+ faults/token
+     - Working set per layer: ~29 experts (from earlier ws_size tracking)
+  
+  2. **70B feasibility math:**
+     - 70B MoE with similar density: ~50 layers × ~100 experts × ~8 MB = **40 GB**
+     - For 8 GB VRAM budget: ~16% of experts can be resident = **~16 experts/layer**
+     - gpt-oss:20b working set (~29 experts) **would NOT fit**
+  
+  3. **For 70B to work, need one of:**
+     - Much smaller per-layer working set (< 16 experts) - depends on model
+     - Layer-aware streaming (only 2-3 layers fully resident at a time)
+     - Aggressive temporal prefetch (predict next layer's experts)
+  
+  ### Key Insight
+  
+  > **The squeeze test reveals the feasibility threshold.**
+  >
+  > If `working_set_per_layer × expert_size × tensors_per_expert > cache_budget_per_layer`,
+  > the system will thrash. This is the hard constraint for 70B models.
+  
+  gpt-oss:20b's working set (29 experts) barely fits at 91% capacity.
+  A 70B model with similar routing behavior would require architectural changes
+  (layer-streaming or more aggressive expert sharing across tokens).
+
 ---
 
 ## END OF DOCUMENT
